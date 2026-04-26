@@ -1,0 +1,65 @@
+name: 'Gearbox - Review'
+description: 'AI 驱动的 PR Code Review'
+author: 'gqy20'
+
+inputs:
+  repo:
+    description: '仓库标识 (owner/name)'
+    required: true
+  pr_number:
+    description: 'PR 编号'
+    required: true
+    type: number
+  max_turns:
+    description: '最大对话轮次'
+    required: false
+    default: '10'
+  parallel_count:
+    description: '并行执行次数'
+    required: false
+    default: '3'
+  model:
+    description: '使用的模型（可选）'
+    required: false
+    default: ''
+  anthropic_api_key:
+    description: 'Anthropic API Key'
+    required: false
+    default: ''
+
+outputs:
+  status:
+    description: '执行状态'
+    value: ${{ steps.run.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup tools
+      uses: ./actions/_setup
+
+    - name: Run Review Agent
+      id: run
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+      run: |
+        set -e
+
+        if [ -n "$ANTHROPIC_API_KEY" ]; then
+          export ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_API_KEY"
+        fi
+
+        MODEL_ARG=""
+        if [ -n "${{ inputs.model }}" ]; then
+          MODEL_ARG="--model ${{ inputs.model }}"
+        fi
+
+        python3 -m gearbox.cli agent review \
+          --repo "${{ inputs.repo }}" \
+          --pr "${{ inputs.pr_number }}" \
+          --max-turns "${{ inputs.max_turns }}" \
+          --parallel-count "${{ inputs.parallel_count }}" \
+          $MODEL_ARG
+
+        echo "status=success" >> $GITHUB_OUTPUT
