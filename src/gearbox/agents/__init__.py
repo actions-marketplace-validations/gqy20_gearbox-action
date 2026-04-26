@@ -7,6 +7,18 @@ from .implement import OUTPUT_SCHEMA as IMPLEMENT_SCHEMA
 from .implement import ImplementResult, run_implement
 from .review import OUTPUT_SCHEMA as REVIEW_SCHEMA
 from .review import ReviewComment, ReviewResult, run_review
+from .shared import (
+    SdkEventLogger,
+    format_currency,
+    json_schema_output,
+    parse_structured_output,
+    prepare_agent_options,
+    read_json_artifact,
+    result_to_github_output,
+    select_best_result,
+    to_jsonable,
+    write_json_artifact,
+)
 from .triage import OUTPUT_SCHEMA as TRIAGE_SCHEMA
 from .triage import TriageResult, run_triage
 
@@ -16,6 +28,16 @@ __all__ = [
     "Issue",
     "AUDIT_SCHEMA",
     "run_audit",
+    "json_schema_output",
+    "parse_structured_output",
+    "prepare_agent_options",
+    "read_json_artifact",
+    "SdkEventLogger",
+    "select_best_result",
+    "to_jsonable",
+    "result_to_github_output",
+    "format_currency",
+    "write_json_artifact",
     # Evaluator
     "EvaluationResult",
     "EVALUATOR_SCHEMA",

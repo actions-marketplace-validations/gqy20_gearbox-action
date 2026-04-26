@@ -54,12 +54,12 @@ inputs:
     description: '最大对话轮次'
     required: false
     default: '20'
-  parallel_count:
-    description: '并行执行次数'
-    required: false
-    default: '3'
   model:
     description: '使用的模型（可选）'
+    required: false
+    default: ''
+  anthropic_base_url:
+    description: 'Anthropic 兼容接口 Base URL（可选）'
     required: false
     default: ''
   anthropic_api_key:
@@ -103,8 +103,8 @@ runs:
         output_dir: ${{ inputs.output_dir }}
         system_prompt: ${{ inputs.system_prompt }}
         max_turns: ${{ inputs.max_turns }}
-        parallel_count: ${{ inputs.parallel_count }}
         model: ${{ inputs.model }}
+        anthropic_base_url: ${{ inputs.anthropic_base_url }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
 
     - name: Run Triage
@@ -115,8 +115,8 @@ runs:
         repo: ${{ inputs.repo }}
         issue_number: ${{ inputs.issue_number }}
         max_turns: ${{ inputs.max_turns }}
-        parallel_count: ${{ inputs.parallel_count }}
         model: ${{ inputs.model }}
+        anthropic_base_url: ${{ inputs.anthropic_base_url }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
 
     - name: Run Implement
@@ -129,6 +129,7 @@ runs:
         base_branch: ${{ inputs.base_branch }}
         max_turns: ${{ inputs.max_turns }}
         model: ${{ inputs.model }}
+        anthropic_base_url: ${{ inputs.anthropic_base_url }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
 
     - name: Run Review
@@ -139,8 +140,8 @@ runs:
         repo: ${{ inputs.repo }}
         pr_number: ${{ inputs.pr_number }}
         max_turns: ${{ inputs.max_turns }}
-        parallel_count: ${{ inputs.parallel_count }}
         model: ${{ inputs.model }}
+        anthropic_base_url: ${{ inputs.anthropic_base_url }}
         anthropic_api_key: ${{ inputs.anthropic_api_key }}
 
     - name: Run Publish

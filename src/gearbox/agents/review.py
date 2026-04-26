@@ -1,9 +1,9 @@
 """Review Agent — PR 自动 Code Review"""
 
 import json
-import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # =============================================================================
@@ -34,7 +34,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "file": {"type": "string"},
-                    "line": {"type": "integer"},
+                    "line": {"type": ["integer", "null"]},
                     "body": {"type": "string"},
                     "severity": {
                         "type": "string",
@@ -74,6 +74,32 @@ class ReviewResult:
     comments: list[ReviewComment]
 
 
+def write_review_result(result: ReviewResult, output_path: Path) -> None:
+    from gearbox.agents.shared.artifacts import write_json_artifact
+
+    write_json_artifact(output_path, result)
+
+
+def load_review_result(path: Path) -> ReviewResult:
+    from gearbox.agents.shared.artifacts import read_json_artifact
+
+    data = read_json_artifact(path)
+    return ReviewResult(
+        verdict=data.get("verdict", "Comment Only"),
+        score=int(data.get("score", 5)),
+        summary=data.get("summary", ""),
+        comments=[
+            ReviewComment(
+                file=comment.get("file", ""),
+                line=comment.get("line"),
+                body=comment.get("body", ""),
+                severity=comment.get("severity", "info"),
+            )
+            for comment in data.get("comments", [])
+        ],
+    )
+
+
 # =============================================================================
 # GitHub API 辅助
 # =============================================================================
@@ -97,37 +123,6 @@ def _gh_pr_diff(repo: str, pr_number: int) -> str:
     cmd = ["gh", "pr", "diff", "--repo", repo, str(pr_number)]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return result.stdout
-
-
-# =============================================================================
-# 结果解析
-# =============================================================================
-
-
-def _parse_result(text: str) -> ReviewResult | None:
-    """从 Agent 输出解析 ReviewResult"""
-    try:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if not match:
-            return None
-        data = json.loads(match.group(1))
-        comments = [
-            ReviewComment(
-                file=c.get("file", ""),
-                line=c.get("line"),
-                body=c.get("body", ""),
-                severity=c.get("severity", "info"),
-            )
-            for c in data.get("comments", [])
-        ]
-        return ReviewResult(
-            verdict=data.get("verdict", "Comment Only"),
-            score=int(data.get("score", 5)),
-            summary=data.get("summary", ""),
-            comments=comments,
-        )
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return None
 
 
 # =============================================================================
@@ -158,23 +153,7 @@ SYSTEM_PROMPT = """你是资深 Code Review 专家。请对 PR 进行全面审�
 
 ## 输出格式
 
-请严格按以下 JSON 格式输出:
-
-```json
-{
-  "verdict": "Request Changes",
-  "score": 6,
-  "summary": "逻辑正确但存在安全问题和测试缺失",
-  "comments": [
-    {
-      "file": "src/auth.py",
-      "line": 42,
-      "body": "此处直接拼接 SQL，存在注入风险",
-      "severity": "blocker"
-    }
-  ]
-}
-```
+请直接返回符合 JSON Schema 的结构化结果，不要输出 Markdown 代码块。
 
 ## 约束
 
@@ -206,7 +185,10 @@ async def run_review(
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    project_root = Path(__file__).parent.parent.parent
+    from gearbox.agents.shared.runtime import prepare_agent_options
+    from gearbox.agents.shared.structured import json_schema_output, parse_structured_output
+
+    project_root = Path(__file__).resolve().parents[3]
     pr_info = _gh_pr_view(repo, pr_number)
     diff_text = _gh_pr_diff(repo, pr_number)
 
@@ -224,36 +206,51 @@ async def run_review(
 ---
 {SYSTEM_PROMPT}"""
 
-    options = ClaudeAgentOptions(
+    options, sdk_logger = prepare_agent_options(
+        ClaudeAgentOptions(
+            model=model,
+            max_turns=max_turns,
+            output_format=json_schema_output(OUTPUT_SCHEMA),
+            allowed_tools=["Read", "Grep", "Glob"],
+            skills="all",
+            cwd=project_root,
+        ),
+        agent_name="review",
+    )
+    sdk_logger.log_start(
         model=model,
         max_turns=max_turns,
-        allowed_tools=["Read", "Grep", "Glob"],
-        skills="all",
-        cwd=project_root,
+        base_url=options.env.get("ANTHROPIC_BASE_URL"),
+        cwd=str(project_root),
     )
 
-    result_text = ""
     structured: ReviewResult | None = None
 
-    async for message in query(prompt=prompt, options=options):
-        if hasattr(message, "content"):
-            for block in message.content:
-                if hasattr(block, "text"):
-                    result_text += block.text
-
-        parsed = _parse_result(result_text)
-        if parsed and not structured:
-            structured = parsed
+    try:
+        async for message in query(prompt=prompt, options=options):
+            sdk_logger.handle_message(message, echo_assistant_text=False)
+            if not structured:
+                structured = parse_structured_output(
+                    message,
+                    lambda data: ReviewResult(
+                        verdict=data.get("verdict", "Comment Only"),
+                        score=int(data.get("score", 5)),
+                        summary=data.get("summary", ""),
+                        comments=[
+                            ReviewComment(
+                                file=comment.get("file", ""),
+                                line=comment.get("line"),
+                                body=comment.get("body", ""),
+                                severity=comment.get("severity", "info"),
+                            )
+                            for comment in data.get("comments", [])
+                        ],
+                    ),
+                )
+    finally:
+        sdk_logger.log_completion()
 
     if structured is None:
-        structured = _parse_result(result_text)
-
-    if structured is None:
-        structured = ReviewResult(
-            verdict="Comment Only",
-            score=5,
-            summary="Review completed with parsing issues",
-            comments=[],
-        )
+        raise RuntimeError("Review agent did not return structured output")
 
     return structured

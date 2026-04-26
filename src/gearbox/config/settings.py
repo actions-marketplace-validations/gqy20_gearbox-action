@@ -8,7 +8,6 @@ import tomli_w
 
 # Agent 默认参数（CLI 和 Action 均引用此处的值）
 AGENT_DEFAULTS: dict[str, Any] = {
-    "parallel_count": 3,
     "max_turns": {
         "triage": 5,
         "review": 10,
@@ -93,13 +92,17 @@ def get_anthropic_base_url() -> str | None:
     if "anthropic_base_url" in config:
         return cast(str, config["anthropic_base_url"])
 
+    env_base_url = os.environ.get("ANTHROPIC_BASE_URL")
+    if env_base_url:
+        return env_base_url
+
     # 如果配置了 provider，使用其默认值
     if "provider" in config:
         provider = PROVIDERS.get(config["provider"])
         if provider:
             return provider["base_url"]
 
-    return os.environ.get("ANTHROPIC_BASE_URL")
+    return None
 
 
 # Provider 预设配置
@@ -128,13 +131,17 @@ def get_anthropic_model() -> str:
     if "anthropic_model" in config:
         return cast(str, config["anthropic_model"])
 
+    env_model = os.environ.get("ANTHROPIC_MODEL")
+    if env_model:
+        return env_model
+
     # 如果配置了 provider，使用其默认值
     if "provider" in config:
         provider = PROVIDERS.get(config["provider"])
         if provider:
             return provider["model"]
 
-    return os.environ.get("ANTHROPIC_MODEL", "glm-5.1")
+    return "glm-5.1"
 
 
 def set_github_token(token: str) -> None:

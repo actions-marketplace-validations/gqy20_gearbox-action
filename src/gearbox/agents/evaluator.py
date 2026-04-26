@@ -1,8 +1,7 @@
 """Evaluator Agent — 通用评估器，评判多个结果的优劣"""
 
 import json
-import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
 # =============================================================================
@@ -65,20 +64,7 @@ SYSTEM_PROMPT = """你是结果评估专家。请评估多个候选结果，选�
 
 ## 输出要求
 
-请严格按以下 JSON 格式输出：
-
-```json
-{
-  "winner": 0,
-  "scores": {
-    "0": 0.85,
-    "1": 0.72,
-    "2": 0.68
-  },
-  "reasoning": "详细解释为什么选择 winner，包括对每个结果的评估",
-  "consensus": ["项 A", "项 B"]
-}
-```
+请直接返回符合 JSON Schema 的结构化结果，不要输出 Markdown 代码块。
 
 - winner: 最佳结果的索引 (0-9)
 - scores: 每个结果的评分 (0-1)
@@ -118,8 +104,9 @@ def build_evaluation_prompt(
 
 def _format_result_for_prompt(result: Any) -> str:
     """将结果格式化为 prompt 文本"""
-    if hasattr(result, "__dict__"):
-        # dataclass
+    if is_dataclass(result):
+        data = asdict(result)
+    elif hasattr(result, "__dict__"):
         data = {
             k: v for k, v in result.__dict__.items() if not k.startswith("_") and not callable(v)
         }
@@ -129,33 +116,6 @@ def _format_result_for_prompt(result: Any) -> str:
         return str(result)
 
     return json.dumps(data, ensure_ascii=False, indent=2)
-
-
-def _parse_evaluation_result(text: str) -> EvaluationResult | None:
-    """从文本解析评估结果"""
-    try:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if not match:
-            match = re.search(r"(\{.*\})", text, re.DOTALL)
-
-        if not match:
-            return None
-
-        data = json.loads(match.group(1))
-
-        # 转换 scores 的 key 为 int
-        scores: dict[int, float] = {}
-        for k, v in data.get("scores", {}).items():
-            scores[int(k)] = float(v)
-
-        return EvaluationResult(
-            winner=int(data.get("winner", 0)),
-            scores=scores,
-            reasoning=data.get("reasoning", ""),
-            consensus=data.get("consensus", []),
-        )
-    except (json.JSONDecodeError, KeyError, ValueError):
-        return None
 
 
 # =============================================================================
@@ -185,59 +145,50 @@ async def run_evaluator(
         EvaluationResult
     """
     from claude_agent_sdk import (
-        AssistantMessage,
         ClaudeAgentOptions,
-        ResultMessage,
-        TextBlock,
         query,
     )
 
+    from gearbox.agents.shared.runtime import prepare_agent_options
+    from gearbox.agents.shared.structured import json_schema_output, parse_structured_output
     from gearbox.config import get_anthropic_model
 
     model = model or get_anthropic_model()
 
     prompt = build_evaluation_prompt(results, result_type, result_names)
 
-    options = ClaudeAgentOptions(
+    options, sdk_logger = prepare_agent_options(
+        ClaudeAgentOptions(
+            model=model,
+            system_prompt=SYSTEM_PROMPT,
+            max_turns=max_turns,
+            output_format=json_schema_output(EVALUATOR_SCHEMA),
+        ),
+        agent_name="evaluator",
+    )
+    sdk_logger.log_start(
         model=model,
-        system_prompt=SYSTEM_PROMPT,
         max_turns=max_turns,
+        base_url=options.env.get("ANTHROPIC_BASE_URL"),
+        cwd="(sdk default)",
     )
 
-    result_text = ""
     structured: EvaluationResult | None = None
 
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    result_text += block.text
-                    print(block.text)
-        elif isinstance(message, ResultMessage):
-            if message.structured_output:
-                try:
-                    scores: dict[int, float] = {}
-                    for k, v in message.structured_output.get("scores", {}).items():
-                        scores[int(k)] = float(v)
-                    structured = EvaluationResult(
-                        winner=int(message.structured_output.get("winner", 0)),
-                        scores=scores,
-                        reasoning=message.structured_output.get("reasoning", ""),
-                        consensus=message.structured_output.get("consensus", []),
-                    )
-                except (KeyError, ValueError, TypeError):
-                    pass
+    try:
+        async for message in query(prompt=prompt, options=options):
+            sdk_logger.handle_message(message, echo_assistant_text=False)
+            if not structured:
+                structured = parse_structured_output(message, lambda data: EvaluationResult(
+                    winner=int(data.get("winner", 0)),
+                    scores={int(k): float(v) for k, v in data.get("scores", {}).items()},
+                    reasoning=data.get("reasoning", ""),
+                    consensus=data.get("consensus", []),
+                ))
+    finally:
+        sdk_logger.log_completion()
 
     if structured is None:
-        structured = _parse_evaluation_result(result_text)
-
-    if structured is None:
-        # 兜底：返回评分最高的结果
-        structured = EvaluationResult(
-            winner=0,
-            scores={i: 0.5 for i in range(len(results))},
-            reasoning="解析失败，使用默认结果",
-            consensus=[],
-        )
+        raise RuntimeError("Evaluator agent did not return structured output")
 
     return structured

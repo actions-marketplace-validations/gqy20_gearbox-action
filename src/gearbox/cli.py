@@ -7,10 +7,12 @@ from pathlib import Path
 
 import click
 
-from .agents.audit import run_audit
+from .agents.audit import load_audit_result, promote_audit_outputs, run_audit
 from .agents.implement import run_implement
-from .agents.review import run_review
-from .agents.triage import run_triage
+from .agents.review import load_review_result, run_review, write_review_result
+from .agents.shared.github_output import format_currency, result_to_github_output
+from .agents.shared.selection import select_best_result
+from .agents.triage import load_triage_result, run_triage, write_triage_result
 from .config import (
     AGENT_DEFAULTS,
     get_config_path,
@@ -22,7 +24,6 @@ from .config import (
     set_github_token,
     set_provider,
 )
-from .core import run_parallel
 from .core.gh import (
     add_issue_labels,
     build_review_body,
@@ -31,7 +32,6 @@ from .core.gh import (
     post_issue_comment,
     post_review_comment,
     prepare_working_branch,
-    write_outputs,
 )
 from .release import build_marketplace_bundle
 
@@ -202,22 +202,6 @@ def package_marketplace(output_dir: str) -> None:
 # =============================================================================
 
 
-def _result_to_github_output(result, output_file: str = "/tmp/github_output") -> None:
-    """通用结果转 GitHub Output 文件"""
-    data = {}
-    for key, value in vars(result).items():
-        if isinstance(value, list):
-            data[key] = json.dumps(value)
-        elif isinstance(value, bool):
-            data[key] = str(value).lower()
-        elif value is None:
-            data[key] = ""
-        else:
-            data[key] = str(value)
-    data["status"] = "success"
-    write_outputs(data, output_file)
-
-
 @cli.group()
 def agent() -> None:
     """运行 Agent (Audit/Triage/Review/Implement)"""
@@ -231,11 +215,11 @@ def agent() -> None:
 @click.option(
     "--max-turns", default=AGENT_DEFAULTS["max_turns"]["triage"], type=int, help="最大对话轮次"
 )
+@click.option("--artifact-path", default="", help="可选: 写出结构化结果 artifact")
 @click.option(
-    "--parallel-count",
-    default=AGENT_DEFAULTS["parallel_count"],
-    type=int,
-    help="并行执行次数（1=不并行）",
+    "--apply-side-effects/--no-apply-side-effects",
+    default=True,
+    help="是否应用 GitHub 标签/评论副作用",
 )
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def triage(
@@ -243,61 +227,36 @@ def triage(
     issue: int,
     model: str,
     max_turns: int,
-    parallel_count: int,
+    artifact_path: str,
+    apply_side_effects: bool,
     output: str,
 ) -> None:
     """运行 Triage Agent - 分析 Issue 并打标签/定优先级"""
-    from gearbox.agents.evaluator import run_evaluator
     from gearbox.config import get_anthropic_model
 
     resolved_model = model or get_anthropic_model()
 
-    if parallel_count > 1:
-        # 同一任务并行执行多次
-        async def agent_factory(_: str):
-            return await run_triage(repo, issue, model=resolved_model, max_turns=max_turns)
-
-        angles = [f"run_{i}" for i in range(parallel_count)]
-        all_results = asyncio.run(run_parallel(agent_factory, angles, model=resolved_model))
-
-        if not all_results:
-            click.echo("❌ No results from parallel execution")
-            return
-
-        evaluation = asyncio.run(
-            run_evaluator(
-                results=all_results,
-                result_type="Triage 分类结果",
-                result_names=angles[: len(all_results)],
-                model=resolved_model,
-            )
+    result = asyncio.run(
+        run_triage(
+            repo,
+            issue,
+            model=resolved_model,
+            max_turns=max_turns,
         )
+    )
+    click.echo(f"✅ Triage: labels={result.labels}, priority={result.priority}")
 
-        result = (
-            all_results[evaluation.winner]
-            if evaluation.winner < len(all_results)
-            else all_results[0]
-        )
-        click.echo(f"✅ Triage (parallel): winner={evaluation.winner}, scores={evaluation.scores}")
-    else:
-        result = asyncio.run(
-            run_triage(
-                repo,
-                issue,
-                model=resolved_model,
-                max_turns=max_turns,
-            )
-        )
-        click.echo(f"✅ Triage: labels={result.labels}, priority={result.priority}")
+    if artifact_path:
+        write_triage_result(result, Path(artifact_path))
 
-    # GitHub 操作
-    add_issue_labels(repo, issue, result.labels)
-    if result.needs_clarification and result.clarification_question:
-        post_issue_comment(repo, issue, f"👋 {result.clarification_question}")
-    if result.ready_to_implement:
-        post_issue_comment(repo, issue, "✅ 此 Issue 分类完成，标记为 ready-to-implement")
+    if apply_side_effects:
+        add_issue_labels(repo, issue, result.labels)
+        if result.needs_clarification and result.clarification_question:
+            post_issue_comment(repo, issue, f"👋 {result.clarification_question}")
+        if result.ready_to_implement:
+            post_issue_comment(repo, issue, "✅ 此 Issue 分类完成，标记为 ready-to-implement")
 
-    _result_to_github_output(result, output)
+    result_to_github_output(result, output)
 
 
 @agent.command()
@@ -307,70 +266,52 @@ def triage(
 @click.option(
     "--max-turns", default=AGENT_DEFAULTS["max_turns"]["review"], type=int, help="最大对话轮次"
 )
+@click.option("--artifact-path", default="", help="可选: 写出结构化结果 artifact")
 @click.option(
-    "--parallel-count",
-    default=AGENT_DEFAULTS["parallel_count"],
-    type=int,
-    help="并行执行次数（1=不并行）",
+    "--apply-side-effects/--no-apply-side-effects",
+    default=True,
+    help="是否应用 GitHub Review 副作用",
 )
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def review(
-    repo: str, pr: int, model: str, max_turns: int, parallel_count: int, output: str
+    repo: str,
+    pr: int,
+    model: str,
+    max_turns: int,
+    artifact_path: str,
+    apply_side_effects: bool,
+    output: str,
 ) -> None:
     """运行 Review Agent - 审查 PR 代码"""
-    from gearbox.agents.evaluator import run_evaluator
     from gearbox.config import get_anthropic_model
 
     resolved_model = model or get_anthropic_model()
 
-    if parallel_count > 1:
-        # 同一任务并行执行多次
-        async def agent_factory(_: str):
-            return await run_review(repo, pr, model=resolved_model, max_turns=max_turns)
-
-        angles = [f"run_{i}" for i in range(parallel_count)]
-        all_results = asyncio.run(run_parallel(agent_factory, angles, model=resolved_model))
-
-        if not all_results:
-            click.echo("❌ No results from parallel execution")
-            return
-
-        evaluation = asyncio.run(
-            run_evaluator(
-                results=all_results,
-                result_type="Review 审查结果",
-                result_names=angles[: len(all_results)],
-                model=resolved_model,
-            )
+    result = asyncio.run(
+        run_review(
+            repo,
+            pr,
+            model=resolved_model,
+            max_turns=max_turns,
         )
+    )
+    click.echo(f"✅ Review: verdict={result.verdict}, score={result.score}")
 
-        result = (
-            all_results[evaluation.winner]
-            if evaluation.winner < len(all_results)
-            else all_results[0]
+    if artifact_path:
+        write_review_result(result, Path(artifact_path))
+
+    if apply_side_effects:
+        comments = [
+            {"file": c.file, "line": c.line, "body": c.body, "severity": c.severity}
+            for c in result.comments
+        ]
+        body = build_review_body(result.verdict, result.score, result.summary, comments)
+        event = {"LGTM": "APPROVE", "Request Changes": "REQUEST_CHANGES"}.get(
+            result.verdict, "COMMENT"
         )
-        click.echo(f"✅ Review (parallel): winner={evaluation.winner}, scores={evaluation.scores}")
-    else:
-        result = asyncio.run(
-            run_review(
-                repo,
-                pr,
-                model=resolved_model,
-                max_turns=max_turns,
-            )
-        )
-        click.echo(f"✅ Review: verdict={result.verdict}, score={result.score}")
+        post_review_comment(repo, pr, body, event)
 
-    # GitHub 操作
-    comments = [
-        {"file": c.file, "line": c.line, "body": c.body, "severity": c.severity}
-        for c in result.comments
-    ]
-    body = build_review_body(result.verdict, result.score, result.summary, comments)
-    event = {"LGTM": "APPROVE", "Request Changes": "REQUEST_CHANGES"}.get(result.verdict, "COMMENT")
-    post_review_comment(repo, pr, body, event)
-
-    _result_to_github_output(result, output)
+    result_to_github_output(result, output)
     click.echo(f"✅ Review: verdict={result.verdict}, score={result.score}")
 
 
@@ -422,7 +363,7 @@ def implement(
             else:
                 click.echo(f"❌ PR creation failed: {pr_result.error}", err=True)
 
-        _result_to_github_output(result, output)
+        result_to_github_output(result, output)
         click.echo(f"✅ Implement: branch={result.branch_name}, ready={result.ready_for_review}")
     finally:
         pass  # 分支已在 finalize_and_create_pr 中处理
@@ -438,12 +379,8 @@ def implement(
 )
 @click.option("--system-prompt", default="", help="自定义 System Prompt（可选）")
 @click.option(
-    "--parallel-count",
-    default=AGENT_DEFAULTS["parallel_count"],
-    type=int,
-    help="并行执行次数（1=不并行）",
+    "--output", default="/tmp/github_output", help="输出文件路径"
 )
-@click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def audit_repo(
     repo: str,
     benchmarks: str,
@@ -451,67 +388,191 @@ def audit_repo(
     model: str,
     max_turns: int,
     system_prompt: str,
-    parallel_count: int,
     output: str,
 ) -> None:
-    """运行 Audit Agent - 审计仓库生成改进建议"""
-    from gearbox.agents.evaluator import run_evaluator
-
+    """运行单次 Audit Agent - 审计仓库生成改进建议。"""
     benchmark_list = benchmarks.split(",") if benchmarks else None
     model_arg = model if model else None
     system_prompt_arg = system_prompt if system_prompt else None
 
-    if parallel_count > 1:
-        # 同一任务并行执行多次
-        async def agent_factory(_: str):
-            return await run_audit(
-                repo,
-                benchmarks=benchmark_list,
-                output_dir=output_dir,
-                model=model_arg,
-                max_turns=max_turns,
-                system_prompt=system_prompt_arg,
-            )
-
-        angles = [f"run_{i}" for i in range(parallel_count)]
-        all_results = asyncio.run(run_parallel(agent_factory, angles, model=model_arg))
-
-        if not all_results:
-            click.echo("❌ No results from parallel execution")
-            return
-
-        evaluation = asyncio.run(
-            run_evaluator(
-                results=all_results,
-                result_type="Audit 审计结果",
-                result_names=angles[: len(all_results)],
-                model=model_arg if model_arg else "claude-sonnet-4-6",
-            )
+    result = asyncio.run(
+        run_audit(
+            repo,
+            benchmarks=benchmark_list,
+            output_dir=output_dir,
+            model=model_arg,
+            max_turns=max_turns,
+            system_prompt=system_prompt_arg,
         )
+    )
+    click.echo(
+        f"✅ Audit: {len(result.issues)} issues, cost={format_currency(result.cost)}"
+    )
 
-        best_result = (
-            all_results[evaluation.winner]
-            if evaluation.winner < len(all_results)
-            else all_results[0]
-        )
-        click.echo(
-            f"✅ Audit (parallel): {len(best_result.issues)} issues, winner={evaluation.winner}"
-        )
-        result = best_result
-    else:
-        result = asyncio.run(
-            run_audit(
-                repo,
-                benchmarks=benchmark_list,
-                output_dir=output_dir,
-                model=model_arg,
-                max_turns=max_turns,
-                system_prompt=system_prompt_arg,
-            )
-        )
-        click.echo(f"✅ Audit: {len(result.issues)} issues, cost={result.cost}")
+    result_to_github_output(result, output)
 
-    _result_to_github_output(result, output)
+
+@agent.command(name="audit-select")
+@click.option("--input-root", required=True, help="并行 audit artifact 根目录")
+@click.option("--output-dir", default="./output", help="胜出结果输出目录")
+@click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--output", default="/tmp/github_output", help="输出文件路径")
+def audit_select(input_root: str, output_dir: str, model: str, output: str) -> None:
+    """聚合多个 audit 结果并选出最佳结果。"""
+    root = Path(input_root)
+    if not root.exists():
+        click.echo(f"❌ 目录不存在: {input_root}", err=True)
+        raise click.Abort()
+
+    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir())
+    if not candidate_dirs:
+        click.echo(f"❌ 未找到任何 audit 结果目录: {input_root}", err=True)
+        raise click.Abort()
+
+    results = []
+    names = []
+    valid_dirs: list[Path] = []
+
+    for run_dir in candidate_dirs:
+        try:
+            results.append(load_audit_result(run_dir))
+            names.append(run_dir.name)
+            valid_dirs.append(run_dir)
+        except FileNotFoundError as exc:
+            click.echo(f"⚠️ 跳过无效结果目录 {run_dir.name}: {exc}")
+
+    if not results:
+        click.echo("❌ 没有可用于聚合的 audit 结果", err=True)
+        raise click.Abort()
+
+    winner_index, winner_result = asyncio.run(
+        select_best_result(
+            results,
+            result_type="Audit 审计结果",
+            result_names=names,
+            model=model or "",
+        )
+    )
+    winner_dir = valid_dirs[winner_index]
+    promote_audit_outputs(winner_dir, Path(output_dir))
+    result_to_github_output(winner_result, output)
+    click.echo(
+        f"✅ Selected audit result: winner={winner_dir.name}, issues={len(winner_result.issues)}"
+    )
+
+
+@agent.command(name="triage-select")
+@click.option("--input-root", required=True, help="并行 triage artifact 根目录")
+@click.option("--repo", required=True, help="仓库标识 (owner/name)")
+@click.option("--issue", required=True, type=int, help="Issue 编号")
+@click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--artifact-path", default="", help="可选: 写出胜出结果 artifact")
+@click.option("--output", default="/tmp/github_output", help="输出文件路径")
+def triage_select(
+    input_root: str,
+    repo: str,
+    issue: int,
+    model: str,
+    artifact_path: str,
+    output: str,
+) -> None:
+    """聚合多个 triage 结果并只应用一次 GitHub 副作用。"""
+    root = Path(input_root)
+    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir())
+    if not candidate_dirs:
+        click.echo(f"❌ 未找到任何 triage 结果目录: {input_root}", err=True)
+        raise click.Abort()
+
+    results = []
+    names = []
+    for run_dir in candidate_dirs:
+        result_path = run_dir / "result.json"
+        if result_path.exists():
+            results.append(load_triage_result(result_path))
+            names.append(run_dir.name)
+
+    if not results:
+        click.echo("❌ 没有可用于聚合的 triage 结果", err=True)
+        raise click.Abort()
+
+    winner_index, winner_result = asyncio.run(
+        select_best_result(
+            results,
+            result_type="Triage 分类结果",
+            result_names=names,
+            model=model or "",
+        )
+    )
+    if artifact_path:
+        write_triage_result(winner_result, Path(artifact_path))
+
+    add_issue_labels(repo, issue, winner_result.labels)
+    if winner_result.needs_clarification and winner_result.clarification_question:
+        post_issue_comment(repo, issue, f"👋 {winner_result.clarification_question}")
+    if winner_result.ready_to_implement:
+        post_issue_comment(repo, issue, "✅ 此 Issue 分类完成，标记为 ready-to-implement")
+
+    result_to_github_output(winner_result, output)
+    click.echo(f"✅ Selected triage result: winner={names[winner_index]}")
+
+
+@agent.command(name="review-select")
+@click.option("--input-root", required=True, help="并行 review artifact 根目录")
+@click.option("--repo", required=True, help="仓库标识 (owner/name)")
+@click.option("--pr", required=True, type=int, help="PR 编号")
+@click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--artifact-path", default="", help="可选: 写出胜出结果 artifact")
+@click.option("--output", default="/tmp/github_output", help="输出文件路径")
+def review_select(
+    input_root: str,
+    repo: str,
+    pr: int,
+    model: str,
+    artifact_path: str,
+    output: str,
+) -> None:
+    """聚合多个 review 结果并只应用一次 GitHub 副作用。"""
+    root = Path(input_root)
+    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir())
+    if not candidate_dirs:
+        click.echo(f"❌ 未找到任何 review 结果目录: {input_root}", err=True)
+        raise click.Abort()
+
+    results = []
+    names = []
+    for run_dir in candidate_dirs:
+        result_path = run_dir / "result.json"
+        if result_path.exists():
+            results.append(load_review_result(result_path))
+            names.append(run_dir.name)
+
+    if not results:
+        click.echo("❌ 没有可用于聚合的 review 结果", err=True)
+        raise click.Abort()
+
+    winner_index, winner_result = asyncio.run(
+        select_best_result(
+            results,
+            result_type="Review 审查结果",
+            result_names=names,
+            model=model or "",
+        )
+    )
+    if artifact_path:
+        write_review_result(winner_result, Path(artifact_path))
+
+    comments = [
+        {"file": c.file, "line": c.line, "body": c.body, "severity": c.severity}
+        for c in winner_result.comments
+    ]
+    body = build_review_body(winner_result.verdict, winner_result.score, winner_result.summary, comments)
+    event = {"LGTM": "APPROVE", "Request Changes": "REQUEST_CHANGES"}.get(
+        winner_result.verdict, "COMMENT"
+    )
+    post_review_comment(repo, pr, body, event)
+
+    result_to_github_output(winner_result, output)
+    click.echo(f"✅ Selected review result: winner={names[winner_index]}")
 
 
 # =============================================================================

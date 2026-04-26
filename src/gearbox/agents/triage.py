@@ -1,9 +1,9 @@
 """Triage Agent — Issue 自动分类、优先级判断和标签管理"""
 
 import json
-import re
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # =============================================================================
@@ -62,6 +62,26 @@ class TriageResult:
     ready_to_implement: bool
 
 
+def write_triage_result(result: TriageResult, output_path: Path) -> None:
+    from gearbox.agents.shared.artifacts import write_json_artifact
+
+    write_json_artifact(output_path, result)
+
+
+def load_triage_result(path: Path) -> TriageResult:
+    from gearbox.agents.shared.artifacts import read_json_artifact
+
+    data = read_json_artifact(path)
+    return TriageResult(
+        labels=data.get("labels", []),
+        priority=data.get("priority", "P3"),
+        complexity=data.get("complexity", "M"),
+        needs_clarification=data.get("needs_clarification", False),
+        clarification_question=data.get("clarification_question"),
+        ready_to_implement=data.get("ready_to_implement", False),
+    )
+
+
 # =============================================================================
 # GitHub API 辅助
 # =============================================================================
@@ -78,31 +98,6 @@ def _gh_issue_view(repo: str, issue_number: int) -> Any:
     ]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return json.loads(result.stdout)
-
-
-# =============================================================================
-# 结果解析
-# =============================================================================
-
-
-def _parse_result(text: str) -> TriageResult | None:
-    """从 Agent 输出文本中解析结构化结果"""
-    try:
-        # 查找 ```json ... ``` 块
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if not match:
-            return None
-        data = json.loads(match.group(1))
-        return TriageResult(
-            labels=data.get("labels", []),
-            priority=data.get("priority", "P3"),
-            complexity=data.get("complexity", "M"),
-            needs_clarification=data.get("needs_clarification", False),
-            clarification_question=data.get("clarification_question"),
-            ready_to_implement=data.get("ready_to_implement", False),
-        )
-    except (json.JSONDecodeError, KeyError):
-        return None
 
 
 # =============================================================================
@@ -137,18 +132,7 @@ SYSTEM_PROMPT = """你是 Issue 分类专家。请分析 GitHub Issue 并提供�
 
 ## 输出格式
 
-请严格按以下 JSON 格式输出（放在 ```json 代码块中）:
-
-```json
-{
-  "labels": ["bug"],
-  "priority": "P1",
-  "complexity": "M",
-  "needs_clarification": false,
-  "clarification_question": null,
-  "ready_to_implement": true
-}
-```
+请直接返回符合 JSON Schema 的结构化结果，不要输出 Markdown 代码块。
 
 **约束**:
 - labels 至少一个标签
@@ -179,9 +163,12 @@ async def run_triage(
     """
     from pathlib import Path
 
-    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+    from claude_agent_sdk import ClaudeAgentOptions, query
 
-    project_root = Path(__file__).parent.parent.parent
+    from gearbox.agents.shared.runtime import prepare_agent_options
+    from gearbox.agents.shared.structured import json_schema_output, parse_structured_output
+
+    project_root = Path(__file__).resolve().parents[3]
     issue = _gh_issue_view(repo, issue_number)
 
     prompt = f"""## Issue 信息
@@ -198,48 +185,42 @@ async def run_triage(
 ---
 {SYSTEM_PROMPT}"""
 
-    options = ClaudeAgentOptions(
+    options, sdk_logger = prepare_agent_options(
+        ClaudeAgentOptions(
+            model=model,
+            max_turns=max_turns,
+            output_format=json_schema_output(OUTPUT_SCHEMA),
+            allowed_tools=["Read", "Bash"],
+            skills="all",
+            cwd=project_root,
+        ),
+        agent_name="triage",
+    )
+    sdk_logger.log_start(
         model=model,
         max_turns=max_turns,
-        allowed_tools=["Read", "Bash"],
-        skills="all",
-        cwd=project_root,
+        base_url=options.env.get("ANTHROPIC_BASE_URL"),
+        cwd=str(project_root),
     )
 
-    result_text = ""
     structured: TriageResult | None = None
 
-    async for message in query(prompt=prompt, options=options):
-        if hasattr(message, "content"):
-            for block in message.content:
-                if hasattr(block, "text"):
-                    result_text += block.text
-
-        if isinstance(message, ResultMessage) and message.structured_output:
-            try:
-                data = message.structured_output
-                structured = TriageResult(
+    try:
+        async for message in query(prompt=prompt, options=options):
+            sdk_logger.handle_message(message, echo_assistant_text=False)
+            if not structured:
+                structured = parse_structured_output(message, lambda data: TriageResult(
                     labels=data.get("labels", []),
                     priority=data.get("priority", "P3"),
                     complexity=data.get("complexity", "M"),
                     needs_clarification=data.get("needs_clarification", False),
                     clarification_question=data.get("clarification_question"),
                     ready_to_implement=data.get("ready_to_implement", False),
-                )
-            except (KeyError, TypeError):
-                pass
+                ))
+    finally:
+        sdk_logger.log_completion()
 
     if structured is None:
-        structured = _parse_result(result_text)
-
-    if structured is None:
-        structured = TriageResult(
-            labels=[],
-            priority="P3",
-            complexity="M",
-            needs_clarification=True,
-            clarification_question="无法自动分类，请手动检查此 Issue",
-            ready_to_implement=False,
-        )
+        raise RuntimeError("Triage agent did not return structured output")
 
     return structured

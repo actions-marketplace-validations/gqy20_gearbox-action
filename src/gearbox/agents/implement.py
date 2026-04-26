@@ -1,7 +1,6 @@
 """Implement Agent — Issue → 分支/PR"""
 
 import json
-import re
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -27,7 +26,7 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "description": "修改的文件路径列表",
         },
         "pr_url": {
-            "type": "string",
+            "type": ["string", "null"],
             "description": "创建的 PR URL，尚未创建时为 null",
         },
         "ready_for_review": {
@@ -86,29 +85,6 @@ def _gh_pr_view(repo: str, pr_number: int) -> Any:
 
 
 # =============================================================================
-# 结果解析
-# =============================================================================
-
-
-def _parse_result(text: str) -> ImplementResult | None:
-    """从 Agent 输出解析 ImplementResult"""
-    try:
-        match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if not match:
-            return None
-        data = json.loads(match.group(1))
-        return ImplementResult(
-            branch_name=data.get("branch_name", ""),
-            summary=data.get("summary", ""),
-            files_changed=data.get("files_changed", []),
-            pr_url=data.get("pr_url"),
-            ready_for_review=data.get("ready_for_review", False),
-        )
-    except (json.JSONDecodeError, KeyError):
-        return None
-
-
-# =============================================================================
 # Prompt
 # =============================================================================
 
@@ -131,19 +107,9 @@ SYSTEM_PROMPT = """你是代码实现专家。请根据 Issue 描述实现代码
 
 ## 输出格式
 
-请严格按以下 JSON 格式输出:
+请直接返回符合 JSON Schema 的结构化结果，不要输出 Markdown 代码块。
 
-```json
-{
-  "branch_name": "feat/issue-42",
-  "summary": "添加用户认证中间件",
-  "files_changed": ["src/auth/middleware.py", "tests/test_auth.py"],
-  "pr_url": null,
-  "ready_for_review": true
-}
-```
-
-创建 PR 后，将 pr_url 填入 JSON。
+创建 PR 后，将 pr_url 填入结构化结果。
 
 ## 约束
 
@@ -177,7 +143,10 @@ async def run_implement(
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
-    project_root = Path(__file__).parent.parent.parent
+    from gearbox.agents.shared.runtime import prepare_agent_options
+    from gearbox.agents.shared.structured import json_schema_output, parse_structured_output
+
+    project_root = Path(__file__).resolve().parents[3]
     issue = _gh_issue_view(repo, issue_number)
     issue_title = issue["title"]
     issue_body = issue["body"] or "(无正文)"
@@ -194,40 +163,45 @@ async def run_implement(
 ---
 {SYSTEM_PROMPT}"""
 
-    options = ClaudeAgentOptions(
+    options, sdk_logger = prepare_agent_options(
+        ClaudeAgentOptions(
+            model=model,
+            max_turns=max_turns,
+            output_format=json_schema_output(OUTPUT_SCHEMA),
+            allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
+            permission_mode="acceptEdits",
+            skills="all",
+            cwd=project_root,
+        ),
+        agent_name="implement",
+    )
+    sdk_logger.log_start(
         model=model,
         max_turns=max_turns,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash"],
-        permission_mode="acceptEdits",
-        skills="all",
-        cwd=project_root,
+        base_url=options.env.get("ANTHROPIC_BASE_URL"),
+        cwd=str(project_root),
     )
 
-    result_text = ""
     structured: ImplementResult | None = None
 
-    async for message in query(prompt=prompt, options=options):
-        if hasattr(message, "content"):
-            for block in message.content:
-                if hasattr(block, "text"):
-                    result_text += block.text
+    try:
+        async for message in query(prompt=prompt, options=options):
+            sdk_logger.handle_message(message, echo_assistant_text=False)
+            if not structured:
+                structured = parse_structured_output(
+                    message,
+                    lambda data: ImplementResult(
+                        branch_name=data.get("branch_name", ""),
+                        summary=data.get("summary", ""),
+                        files_changed=data.get("files_changed", []),
+                        pr_url=data.get("pr_url"),
+                        ready_for_review=data.get("ready_for_review", False),
+                    ),
+                )
+    finally:
+        sdk_logger.log_completion()
 
-        # 尝试解析中间结果（Agent 可能分多次输出）
-        parsed = _parse_result(result_text)
-        if parsed and not structured:
-            structured = parsed
-
-    # 最终解析
     if structured is None:
-        structured = _parse_result(result_text)
-
-    if structured is None:
-        structured = ImplementResult(
-            branch_name="",
-            summary="实现失败或超时",
-            files_changed=[],
-            pr_url=None,
-            ready_for_review=False,
-        )
+        raise RuntimeError("Implement agent did not return structured output")
 
     return structured

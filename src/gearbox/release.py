@@ -46,6 +46,19 @@ Gearbox 的 Marketplace 发布仓。
     anthropic_api_key: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
 ```
 
+需要真正的 matrix 并行编排时，请改用主开发仓中的 reusable workflows：
+
+```yaml
+jobs:
+  audit:
+    uses: gqy20/gearbox/.github/workflows/reusable-audit.yml@main
+    with:
+      repo: owner/repo
+      parallel_runs: '3'
+      create_issues: false
+    secrets: inherit
+```
+
 ## 支持的动作
 
 {action_lines}
@@ -78,6 +91,7 @@ def build_marketplace_bundle(output_dir: Path) -> Path:
         ignore=_ignore_runtime_junk,
     )
     shutil.copy2(project_root / "pyproject.toml", output_dir / "pyproject.toml")
+    shutil.copy2(project_root / "uv.lock", output_dir / "uv.lock")
 
     router_action = project_root / "actions" / "main" / "action.yml"
     router_text = router_action.read_text(encoding="utf-8")
