@@ -8,6 +8,8 @@ from typing import Any
 # Schema 定义
 # =============================================================================
 
+DEFAULT_EVALUATOR_MAX_TURNS = 29
+
 EVALUATOR_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -82,7 +84,7 @@ def build_evaluation_prompt(
 
     Args:
         results: 结果列表
-        result_type: 结果类型描述（如 "Audit 结果"、"Triage 结果"）
+        result_type: 结果类型描述（如 "Audit 结果"、"Backlog 结果"）
         result_names: 可选的名称列表（如 ["质量角度", "安全角度"]）
 
     Returns:
@@ -104,7 +106,7 @@ def build_evaluation_prompt(
 
 def _format_result_for_prompt(result: Any) -> str:
     """将结果格式化为 prompt 文本"""
-    if is_dataclass(result):
+    if is_dataclass(result) and not isinstance(result, type):
         data = asdict(result)
     elif hasattr(result, "__dict__"):
         data = {
@@ -129,7 +131,7 @@ async def run_evaluator(
     result_names: list[str] | None = None,
     *,
     model: str = "claude-sonnet-4-6",
-    max_turns: int = 5,
+    max_turns: int = DEFAULT_EVALUATOR_MAX_TURNS,
 ) -> EvaluationResult:
     """
     运行评估器。
@@ -178,13 +180,19 @@ async def run_evaluator(
     try:
         async for message in query(prompt=prompt, options=options):
             sdk_logger.handle_message(message, echo_assistant_text=False)
-            if not structured:
-                structured = parse_structured_output(message, lambda data: EvaluationResult(
-                    winner=int(data.get("winner", 0)),
-                    scores={int(k): float(v) for k, v in data.get("scores", {}).items()},
-                    reasoning=data.get("reasoning", ""),
-                    consensus=data.get("consensus", []),
-                ))
+            if structured is None:
+                parsed = parse_structured_output(
+                    message,
+                    lambda data: EvaluationResult(
+                        winner=int(data.get("winner", 0)),
+                        scores={int(k): float(v) for k, v in data.get("scores", {}).items()},
+                        reasoning=data.get("reasoning", ""),
+                        consensus=data.get("consensus", []),
+                    ),
+                )
+                if parsed is not None:
+                    structured = parsed
+                    break
     finally:
         sdk_logger.log_completion()
 

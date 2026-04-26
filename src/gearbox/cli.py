@@ -2,17 +2,30 @@
 
 import asyncio
 import json
+import subprocess
 import traceback
 from pathlib import Path
 
 import click
 
 from .agents.audit import load_audit_result, promote_audit_outputs, run_audit
-from .agents.implement import run_implement
+from .agents.backlog import (
+    BacklogItemResult,
+    BacklogResult,
+    github_labels_for_backlog_item,
+    load_backlog_result,
+    parse_issue_numbers,
+    run_backlog_item,
+    write_backlog_result,
+)
+from .agents.implement import (
+    load_implement_result,
+    run_implement,
+    write_implement_result,
+)
 from .agents.review import load_review_result, run_review, write_review_result
 from .agents.shared.github_output import format_currency, result_to_github_output
 from .agents.shared.selection import select_best_result
-from .agents.triage import load_triage_result, run_triage, write_triage_result
 from .config import (
     AGENT_DEFAULTS,
     get_config_path,
@@ -25,15 +38,59 @@ from .config import (
     set_provider,
 )
 from .core.gh import (
-    add_issue_labels,
     build_review_body,
     create_issue,
+    create_pr,
     finalize_and_create_pr,
+    finalize_and_push,
     post_issue_comment,
     post_review_comment,
     prepare_working_branch,
+    replace_managed_issue_labels,
 )
-from .release import build_marketplace_bundle
+from .release import build_marketplace_bundle, release_notes_for_version
+
+
+def _candidate_result_files(input_root: Path) -> list[tuple[str, Path]]:
+    """Return result.json files from both flat and per-artifact layouts."""
+    candidates: list[tuple[str, Path]] = []
+    flat_result = input_root / "result.json"
+    if flat_result.exists():
+        candidates.append((input_root.name, flat_result))
+
+    if input_root.exists():
+        for run_dir in sorted(path for path in input_root.iterdir() if path.is_dir()):
+            result_path = run_dir / "result.json"
+            if result_path.exists():
+                candidates.append((run_dir.name, result_path))
+
+    return candidates
+
+
+def _apply_backlog_item(repo: str, result: object, fallback_issue: int | None = None) -> None:
+    """Apply one backlog classification item to GitHub with idempotent managed labels."""
+    issue_number = getattr(result, "issue_number", None) or fallback_issue
+    if issue_number is None:
+        raise click.ClickException("backlog item missing issue_number")
+
+    labels = github_labels_for_backlog_item(result)  # type: ignore[arg-type]
+    label_result = replace_managed_issue_labels(repo, issue_number, labels)
+    if not label_result.success:
+        click.echo(f"⚠️ 添加标签失败: {label_result.url}", err=True)
+
+    needs_clarification = bool(getattr(result, "needs_clarification", False))
+    clarification_question = getattr(result, "clarification_question", None)
+    ready_to_implement = bool(getattr(result, "ready_to_implement", False))
+    if needs_clarification and clarification_question:
+        comment_result = post_issue_comment(repo, issue_number, f"👋 {clarification_question}")
+        if not comment_result.success:
+            click.echo(f"⚠️ 发布评论失败: {comment_result.url}", err=True)
+    if ready_to_implement:
+        comment_result = post_issue_comment(
+            repo, issue_number, "✅ 此 Issue 分类完成，标记为 ready-to-implement"
+        )
+        if not comment_result.success:
+            click.echo(f"⚠️ 发布评论失败: {comment_result.url}", err=True)
 
 
 @click.group()
@@ -197,6 +254,21 @@ def package_marketplace(output_dir: str) -> None:
     click.echo(f"✅ Marketplace bundle written to: {bundle_dir}")
 
 
+@cli.command("release-notes")
+@click.option("--version", required=True, help="版本号，例如 v1.1.2")
+@click.option("--output-file", default="", help="可选：写入目标文件")
+def release_notes(version: str, output_file: str) -> None:
+    """输出指定版本的 CHANGELOG 条目。"""
+    notes = release_notes_for_version(version)
+    if output_file:
+        path = Path(output_file)
+        path.write_text(notes, encoding="utf-8")
+        click.echo(f"✅ Release notes written to: {path}")
+        return
+
+    click.echo(notes, nl=False)
+
+
 # =============================================================================
 # Agent 命令
 # =============================================================================
@@ -204,57 +276,61 @@ def package_marketplace(output_dir: str) -> None:
 
 @cli.group()
 def agent() -> None:
-    """运行 Agent (Audit/Triage/Review/Implement)"""
+    """运行 Agent (Audit/Backlog/Review/Implement)"""
     pass
 
 
-@agent.command()
+@agent.command(name="backlog")
 @click.option("--repo", required=True, help="仓库标识 (owner/name)")
-@click.option("--issue", required=True, type=int, help="Issue 编号")
+@click.option("--issues", required=True, help="逗号或空格分隔的 Issue 编号")
 @click.option("--model", default="", help="使用的模型（默认从 provider 配置读取）")
 @click.option(
-    "--max-turns", default=AGENT_DEFAULTS["max_turns"]["triage"], type=int, help="最大对话轮次"
+    "--max-turns", default=AGENT_DEFAULTS["max_turns"]["backlog"], type=int, help="最大对话轮次"
 )
-@click.option("--artifact-path", default="", help="可选: 写出结构化结果 artifact")
+@click.option("--artifact-path", default="", help="可选: 写出结构化 backlog artifact")
 @click.option(
     "--apply-side-effects/--no-apply-side-effects",
-    default=True,
-    help="是否应用 GitHub 标签/评论副作用",
+    default=False,
+    help="是否应用 GitHub 标签/评论副作用（并行时建议关闭）",
 )
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
-def triage(
+def backlog(
     repo: str,
-    issue: int,
+    issues: str,
     model: str,
     max_turns: int,
     artifact_path: str,
     apply_side_effects: bool,
     output: str,
 ) -> None:
-    """运行 Triage Agent - 分析 Issue 并打标签/定优先级"""
+    """运行 Backlog Agent - 统一处理单个或多个 Issue 分类。"""
     from gearbox.config import get_anthropic_model
 
-    resolved_model = model or get_anthropic_model()
+    issue_numbers = parse_issue_numbers(issues)
+    if not issue_numbers:
+        raise click.ClickException("--issues must contain at least one issue number")
 
-    result = asyncio.run(
-        run_triage(
-            repo,
-            issue,
-            model=resolved_model,
-            max_turns=max_turns,
+    resolved_model = model or get_anthropic_model()
+    items = [
+        asyncio.run(
+            run_backlog_item(
+                repo,
+                issue_number,
+                model=resolved_model,
+                max_turns=max_turns,
+            )
         )
-    )
-    click.echo(f"✅ Triage: labels={result.labels}, priority={result.priority}")
+        for issue_number in issue_numbers
+    ]
+    result = BacklogResult(items=items)
+    click.echo(f"✅ Backlog: issues={','.join(str(item.issue_number) for item in items)}")
 
     if artifact_path:
-        write_triage_result(result, Path(artifact_path))
+        write_backlog_result(result, Path(artifact_path))
 
     if apply_side_effects:
-        add_issue_labels(repo, issue, result.labels)
-        if result.needs_clarification and result.clarification_question:
-            post_issue_comment(repo, issue, f"👋 {result.clarification_question}")
-        if result.ready_to_implement:
-            post_issue_comment(repo, issue, "✅ 此 Issue 分类完成，标记为 ready-to-implement")
+        for item in result.items:
+            _apply_backlog_item(repo, item)
 
     result_to_github_output(result, output)
 
@@ -269,8 +345,8 @@ def triage(
 @click.option("--artifact-path", default="", help="可选: 写出结构化结果 artifact")
 @click.option(
     "--apply-side-effects/--no-apply-side-effects",
-    default=True,
-    help="是否应用 GitHub Review 副作用",
+    default=False,
+    help="是否应用 GitHub Review 副作用（并行时建议关闭）",
 )
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def review(
@@ -309,7 +385,9 @@ def review(
         event = {"LGTM": "APPROVE", "Request Changes": "REQUEST_CHANGES"}.get(
             result.verdict, "COMMENT"
         )
-        post_review_comment(repo, pr, body, event)
+        review_result = post_review_comment(repo, pr, body, event)
+        if not review_result.success:
+            click.echo(f"⚠️ 发布 Review 失败: {review_result.url}", err=True)
 
     result_to_github_output(result, output)
     click.echo(f"✅ Review: verdict={result.verdict}, score={result.score}")
@@ -323,9 +401,22 @@ def review(
 @click.option(
     "--max-turns", default=AGENT_DEFAULTS["max_turns"]["implement"], type=int, help="最大对话轮次"
 )
+@click.option("--artifact-path", default="", help="可选: 写出结构化结果 artifact")
+@click.option(
+    "--apply-side-effects/--no-apply-side-effects",
+    default=False,
+    help="是否创建分支/PR（并行时建议关闭）",
+)
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def implement(
-    repo: str, issue: int, model: str, base_branch: str, max_turns: int, output: str
+    repo: str,
+    issue: int,
+    model: str,
+    base_branch: str,
+    max_turns: int,
+    artifact_path: str,
+    apply_side_effects: bool,
+    output: str,
 ) -> None:
     """运行 Implement Agent - 实现 Issue 并创建 PR"""
     from gearbox.config import get_anthropic_model
@@ -345,7 +436,7 @@ def implement(
             )
         )
 
-        if result.ready_for_review and result.branch_name:
+        if apply_side_effects and result.ready_for_review and result.branch_name:
             commit_msg = f"feat: {result.summary}\n\nCloses #{issue}"
             pr_body = f"## Summary\n\n{result.summary}\n\nCloses #{issue}"
             pr_result = finalize_and_create_pr(
@@ -362,6 +453,22 @@ def implement(
                 click.echo(f"✅ PR created: {pr_result.pr_url}")
             else:
                 click.echo(f"❌ PR creation failed: {pr_result.error}", err=True)
+        elif result.ready_for_review and result.branch_name:
+            # Push branch without creating PR (for parallel execution)
+            commit_msg = f"feat: {result.summary}\n\nCloses #{issue}"
+            pushed = finalize_and_push(
+                temp_branch=temp_branch,
+                final_branch=result.branch_name,
+                commit_message=commit_msg,
+                files=result.files_changed,
+            )
+            if pushed:
+                click.echo(f"✅ Branch pushed: {result.branch_name}")
+            else:
+                click.echo(f"⚠️ No changes to push for branch: {result.branch_name}")
+
+        if artifact_path:
+            write_implement_result(result, Path(artifact_path))
 
         result_to_github_output(result, output)
         click.echo(f"✅ Implement: branch={result.branch_name}, ready={result.ready_for_review}")
@@ -378,9 +485,8 @@ def implement(
     "--max-turns", default=AGENT_DEFAULTS["max_turns"]["audit"], type=int, help="最大对话轮次"
 )
 @click.option("--system-prompt", default="", help="自定义 System Prompt（可选）")
-@click.option(
-    "--output", default="/tmp/github_output", help="输出文件路径"
-)
+@click.option("--output", default="/tmp/github_output", help="输出文件路径")
+@click.option("--no-prescan", is_flag=True, help="跳过预扫描步骤（静态分析）")
 def audit_repo(
     repo: str,
     benchmarks: str,
@@ -389,6 +495,7 @@ def audit_repo(
     max_turns: int,
     system_prompt: str,
     output: str,
+    no_prescan: bool,
 ) -> None:
     """运行单次 Audit Agent - 审计仓库生成改进建议。"""
     benchmark_list = benchmarks.split(",") if benchmarks else None
@@ -403,11 +510,10 @@ def audit_repo(
             model=model_arg,
             max_turns=max_turns,
             system_prompt=system_prompt_arg,
+            enable_prescan=not no_prescan,
         )
     )
-    click.echo(
-        f"✅ Audit: {len(result.issues)} issues, cost={format_currency(result.cost)}"
-    )
+    click.echo(f"✅ Audit: {len(result.issues)} issues, cost={format_currency(result.cost)}")
 
     result_to_github_output(result, output)
 
@@ -416,8 +522,9 @@ def audit_repo(
 @click.option("--input-root", required=True, help="并行 audit artifact 根目录")
 @click.option("--output-dir", default="./output", help="胜出结果输出目录")
 @click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--max-turns", default=29, type=int, help="Evaluator 最大对话轮次")
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
-def audit_select(input_root: str, output_dir: str, model: str, output: str) -> None:
+def audit_select(input_root: str, output_dir: str, model: str, max_turns: int, output: str) -> None:
     """聚合多个 audit 结果并选出最佳结果。"""
     root = Path(input_root)
     if not root.exists():
@@ -451,6 +558,7 @@ def audit_select(input_root: str, output_dir: str, model: str, output: str) -> N
             result_type="Audit 审计结果",
             result_names=names,
             model=model or "",
+            max_turns=max_turns,
         )
     )
     winner_dir = valid_dirs[winner_index]
@@ -461,59 +569,60 @@ def audit_select(input_root: str, output_dir: str, model: str, output: str) -> N
     )
 
 
-@agent.command(name="triage-select")
-@click.option("--input-root", required=True, help="并行 triage artifact 根目录")
+@agent.command(name="backlog-select")
+@click.option("--input-root", required=True, help="并行 backlog artifact 根目录")
 @click.option("--repo", required=True, help="仓库标识 (owner/name)")
-@click.option("--issue", required=True, type=int, help="Issue 编号")
 @click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--max-turns", default=29, type=int, help="Evaluator 最大对话轮次")
 @click.option("--artifact-path", default="", help="可选: 写出胜出结果 artifact")
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
-def triage_select(
+def backlog_select(
     input_root: str,
     repo: str,
-    issue: int,
     model: str,
+    max_turns: int,
     artifact_path: str,
     output: str,
 ) -> None:
-    """聚合多个 triage 结果并只应用一次 GitHub 副作用。"""
+    """聚合多个 backlog 结果并按 issue 只应用一次 GitHub 副作用。"""
     root = Path(input_root)
-    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir())
-    if not candidate_dirs:
-        click.echo(f"❌ 未找到任何 triage 结果目录: {input_root}", err=True)
+    candidate_files = _candidate_result_files(root)
+    if not candidate_files:
+        click.echo(f"❌ 未找到任何 backlog 结果: {input_root}", err=True)
         raise click.Abort()
 
-    results = []
-    names = []
-    for run_dir in candidate_dirs:
-        result_path = run_dir / "result.json"
-        if result_path.exists():
-            results.append(load_triage_result(result_path))
-            names.append(run_dir.name)
+    by_issue: dict[int, list[tuple[str, BacklogItemResult]]] = {}
+    for name, result_path in candidate_files:
+        backlog_result = load_backlog_result(result_path)
+        for item in backlog_result.items:
+            if item.issue_number is None:
+                raise click.ClickException(f"{result_path} missing issue_number")
+            by_issue.setdefault(item.issue_number, []).append((name, item))
 
-    if not results:
-        click.echo("❌ 没有可用于聚合的 triage 结果", err=True)
-        raise click.Abort()
-
-    winner_index, winner_result = asyncio.run(
-        select_best_result(
-            results,
-            result_type="Triage 分类结果",
-            result_names=names,
-            model=model or "",
+    selected_items: list[BacklogItemResult] = []
+    for issue_number in sorted(by_issue):
+        candidates = by_issue[issue_number]
+        names = [name for name, _ in candidates]
+        results = [item for _, item in candidates]
+        winner_index, winner_result = asyncio.run(
+            select_best_result(
+                results,
+                result_type=f"Backlog Issue #{issue_number} 分类结果",
+                result_names=names,
+                model=model or "",
+                max_turns=max_turns,
+            )
         )
-    )
+        selected_items.append(winner_result)
+        _apply_backlog_item(repo, winner_result)
+        click.echo(
+            f"✅ Selected backlog result: issue={issue_number}, winner={names[winner_index]}"
+        )
+
+    result = BacklogResult(items=selected_items)
     if artifact_path:
-        write_triage_result(winner_result, Path(artifact_path))
-
-    add_issue_labels(repo, issue, winner_result.labels)
-    if winner_result.needs_clarification and winner_result.clarification_question:
-        post_issue_comment(repo, issue, f"👋 {winner_result.clarification_question}")
-    if winner_result.ready_to_implement:
-        post_issue_comment(repo, issue, "✅ 此 Issue 分类完成，标记为 ready-to-implement")
-
-    result_to_github_output(winner_result, output)
-    click.echo(f"✅ Selected triage result: winner={names[winner_index]}")
+        write_backlog_result(result, Path(artifact_path))
+    result_to_github_output(result, output)
 
 
 @agent.command(name="review-select")
@@ -521,6 +630,7 @@ def triage_select(
 @click.option("--repo", required=True, help="仓库标识 (owner/name)")
 @click.option("--pr", required=True, type=int, help="PR 编号")
 @click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--max-turns", default=29, type=int, help="Evaluator 最大对话轮次")
 @click.option("--artifact-path", default="", help="可选: 写出胜出结果 artifact")
 @click.option("--output", default="/tmp/github_output", help="输出文件路径")
 def review_select(
@@ -528,23 +638,22 @@ def review_select(
     repo: str,
     pr: int,
     model: str,
+    max_turns: int,
     artifact_path: str,
     output: str,
 ) -> None:
     """聚合多个 review 结果并只应用一次 GitHub 副作用。"""
     root = Path(input_root)
-    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir())
-    if not candidate_dirs:
-        click.echo(f"❌ 未找到任何 review 结果目录: {input_root}", err=True)
+    candidate_files = _candidate_result_files(root)
+    if not candidate_files:
+        click.echo(f"❌ 未找到任何 review 结果: {input_root}", err=True)
         raise click.Abort()
 
     results = []
     names = []
-    for run_dir in candidate_dirs:
-        result_path = run_dir / "result.json"
-        if result_path.exists():
-            results.append(load_review_result(result_path))
-            names.append(run_dir.name)
+    for name, result_path in candidate_files:
+        results.append(load_review_result(result_path))
+        names.append(name)
 
     if not results:
         click.echo("❌ 没有可用于聚合的 review 结果", err=True)
@@ -556,6 +665,7 @@ def review_select(
             result_type="Review 审查结果",
             result_names=names,
             model=model or "",
+            max_turns=max_turns,
         )
     )
     if artifact_path:
@@ -565,14 +675,98 @@ def review_select(
         {"file": c.file, "line": c.line, "body": c.body, "severity": c.severity}
         for c in winner_result.comments
     ]
-    body = build_review_body(winner_result.verdict, winner_result.score, winner_result.summary, comments)
+    body = build_review_body(
+        winner_result.verdict, winner_result.score, winner_result.summary, comments
+    )
     event = {"LGTM": "APPROVE", "Request Changes": "REQUEST_CHANGES"}.get(
         winner_result.verdict, "COMMENT"
     )
-    post_review_comment(repo, pr, body, event)
+    review_result = post_review_comment(repo, pr, body, event)
+    if not review_result.success:
+        click.echo(f"⚠️ 发布 Review 失败: {review_result.url}", err=True)
 
     result_to_github_output(winner_result, output)
     click.echo(f"✅ Selected review result: winner={names[winner_index]}")
+
+
+@agent.command(name="implement-select")
+@click.option("--input-root", required=True, help="并行 implement artifact 根目录")
+@click.option("--repo", required=True, help="仓库标识 (owner/name)")
+@click.option("--issue", required=True, type=int, help="Issue 编号")
+@click.option("--base-branch", default="main", help="PR 目标分支")
+@click.option("--model", default="", help="用于评估多个结果的模型")
+@click.option("--max-turns", default=29, type=int, help="Evaluator 最大对话轮次")
+@click.option("--artifact-path", default="", help="可选: 写出胜出结果 artifact")
+@click.option("--output", default="/tmp/github_output", help="输出文件路径")
+def implement_select(
+    input_root: str,
+    repo: str,
+    issue: int,
+    base_branch: str,
+    model: str,
+    max_turns: int,
+    artifact_path: str,
+    output: str,
+) -> None:
+    """聚合多个 implement 结果并创建最佳 PR。"""
+    from gearbox.config import get_anthropic_model
+
+    resolved_model = model or get_anthropic_model()
+
+    root = Path(input_root)
+    candidate_files = _candidate_result_files(root)
+    if not candidate_files:
+        click.echo(f"❌ 未找到任何 implement 结果: {input_root}", err=True)
+        raise click.Abort()
+
+    results = []
+    names = []
+    for name, result_path in candidate_files:
+        results.append(load_implement_result(result_path))
+        names.append(name)
+
+    if not results:
+        click.echo("❌ 没有可用于聚合的 implement 结果", err=True)
+        raise click.Abort()
+
+    winner_index, winner_result = asyncio.run(
+        select_best_result(
+            results,
+            result_type="Implement 实现结果",
+            result_names=names,
+            model=resolved_model,
+            max_turns=max_turns,
+        )
+    )
+
+    click.echo(f"✅ Selected implement result: winner={names[winner_index]}")
+    click.echo(f"   branch={winner_result.branch_name}, files={len(winner_result.files_changed)}")
+
+    if artifact_path:
+        write_implement_result(winner_result, Path(artifact_path))
+
+    # Create PR for the winning result
+    if winner_result.ready_for_review and winner_result.branch_name:
+        # Fetch the branch that was pushed by the parallel run
+        subprocess.run(
+            ["git", "fetch", "origin", winner_result.branch_name],
+            check=True,
+        )
+        pr_body = f"## Summary\n\n{winner_result.summary}\n\nCloses #{issue}"
+        pr_result = create_pr(
+            repo=repo,
+            title=f"feat(#{issue}): {winner_result.summary}",
+            body=pr_body,
+            head=winner_result.branch_name,
+            base=base_branch,
+        )
+        if pr_result.success:
+            winner_result.pr_url = pr_result.pr_url
+            click.echo(f"✅ PR created: {pr_result.pr_url}")
+        else:
+            click.echo(f"❌ PR creation failed: {pr_result.error}", err=True)
+
+    result_to_github_output(winner_result, output)
 
 
 # =============================================================================

@@ -3,7 +3,8 @@
 import json
 import subprocess
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 # =============================================================================
 # Schema 定义
@@ -51,6 +52,27 @@ class ImplementResult:
     files_changed: list[str]
     pr_url: str | None
     ready_for_review: bool
+
+
+def write_implement_result(result: ImplementResult, output_path: Path) -> None:
+    """写出 Implement 结果到 artifact 文件"""
+    from gearbox.agents.shared.artifacts import write_json_artifact
+
+    write_json_artifact(output_path, result)
+
+
+def load_implement_result(path: Path) -> ImplementResult:
+    """从 artifact 文件加载 Implement 结果"""
+    from gearbox.agents.shared.artifacts import read_json_artifact
+
+    data = read_json_artifact(path)
+    return ImplementResult(
+        branch_name=cast(str, data.get("branch_name", "")),
+        summary=cast(str, data.get("summary", "")),
+        files_changed=cast(list[str], data.get("files_changed", [])),
+        pr_url=cast(str | None, data.get("pr_url")),
+        ready_for_review=cast(bool, data.get("ready_for_review", False)),
+    )
 
 
 # =============================================================================
@@ -187,8 +209,8 @@ async def run_implement(
     try:
         async for message in query(prompt=prompt, options=options):
             sdk_logger.handle_message(message, echo_assistant_text=False)
-            if not structured:
-                structured = parse_structured_output(
+            if structured is None:
+                parsed = parse_structured_output(
                     message,
                     lambda data: ImplementResult(
                         branch_name=data.get("branch_name", ""),
@@ -198,6 +220,9 @@ async def run_implement(
                         ready_for_review=data.get("ready_for_review", False),
                     ),
                 )
+                if parsed is not None:
+                    structured = parsed
+                    break
     finally:
         sdk_logger.log_completion()
 

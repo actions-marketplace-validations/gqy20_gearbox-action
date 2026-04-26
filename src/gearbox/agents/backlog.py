@@ -1,10 +1,11 @@
-"""Triage Agent — Issue 自动分类、优先级判断和标签管理"""
+"""Backlog Agent — Issue 自动分类、优先级判断和标签管理"""
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 # =============================================================================
 # Schema 定义（形式化，代码和文档共用）
@@ -51,8 +52,8 @@ OUTPUT_SCHEMA: dict[str, Any] = {
 
 
 @dataclass
-class TriageResult:
-    """Triage 分析结果（对应 OUTPUT_SCHEMA）"""
+class BacklogItemResult:
+    """单个 Backlog Issue 的分类结果（对应 OUTPUT_SCHEMA）"""
 
     labels: list[str]
     priority: str  # P0/P1/P2/P3
@@ -60,25 +61,63 @@ class TriageResult:
     needs_clarification: bool
     clarification_question: str | None
     ready_to_implement: bool
+    issue_number: int | None = None
 
 
-def write_triage_result(result: TriageResult, output_path: Path) -> None:
+@dataclass
+class BacklogResult:
+    """Backlog 分类结果，单 issue 是多 issue 的特例。"""
+
+    items: list[BacklogItemResult]
+
+
+def parse_issue_numbers(value: str) -> list[int]:
+    """Parse comma/space separated issue numbers."""
+    numbers = [int(part) for part in re.split(r"[\s,]+", value.strip()) if part]
+    return list(dict.fromkeys(numbers))
+
+
+def github_labels_for_backlog_item(result: BacklogItemResult) -> list[str]:
+    """Return GitHub labels that represent the full backlog classification decision."""
+    labels = [
+        *result.labels,
+        result.priority,
+        f"complexity:{result.complexity}",
+    ]
+
+    if result.needs_clarification:
+        labels.append("needs-clarification")
+    if result.ready_to_implement:
+        labels.append("ready-to-implement")
+
+    return list(dict.fromkeys(label for label in labels if label))
+
+
+def write_backlog_result(result: BacklogResult, output_path: Path) -> None:
     from gearbox.agents.shared.artifacts import write_json_artifact
 
     write_json_artifact(output_path, result)
 
 
-def load_triage_result(path: Path) -> TriageResult:
+def load_backlog_result(path: Path) -> BacklogResult:
     from gearbox.agents.shared.artifacts import read_json_artifact
 
     data = read_json_artifact(path)
-    return TriageResult(
-        labels=data.get("labels", []),
-        priority=data.get("priority", "P3"),
-        complexity=data.get("complexity", "M"),
-        needs_clarification=data.get("needs_clarification", False),
-        clarification_question=data.get("clarification_question"),
-        ready_to_implement=data.get("ready_to_implement", False),
+    raw_items = data.get("items", [])
+    assert isinstance(raw_items, list)
+    return BacklogResult(
+        items=[
+            BacklogItemResult(
+                issue_number=cast(int | None, item.get("issue_number")),
+                labels=cast(list[str], item.get("labels", [])),
+                priority=cast(str, item.get("priority", "P3")),
+                complexity=cast(str, item.get("complexity", "M")),
+                needs_clarification=cast(bool, item.get("needs_clarification", False)),
+                clarification_question=cast(str | None, item.get("clarification_question")),
+                ready_to_implement=cast(bool, item.get("ready_to_implement", False)),
+            )
+            for item in cast(list[dict[str, object]], raw_items)
+        ]
     )
 
 
@@ -94,7 +133,7 @@ def _gh_issue_view(repo: str, issue_number: int) -> Any:
         "api",
         f"/repos/{repo}/issues/{issue_number}",
         "--jq",
-        "{title:.title,body:.body,labels:.labels[].name,state:.state}",
+        "{title:.title,body:.body,labels:[.labels[].name],state:.state}",
     ]
     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
     return json.loads(result.stdout)
@@ -142,13 +181,13 @@ SYSTEM_PROMPT = """你是 Issue 分类专家。请分析 GitHub Issue 并提供�
 - ready_to_implement=true 表示可进入实现阶段"""
 
 
-async def run_triage(
+async def run_backlog_item(
     repo: str,
     issue_number: int,
     *,
     model: str = "claude-sonnet-4-6",
     max_turns: int = 5,
-) -> TriageResult:
+) -> BacklogItemResult:
     """
     执行 Issue 分类。
 
@@ -159,7 +198,7 @@ async def run_triage(
         max_turns: 最大对话轮次
 
     Returns:
-        TriageResult 结构
+        BacklogItemResult 结构
     """
     from pathlib import Path
 
@@ -194,7 +233,7 @@ async def run_triage(
             skills="all",
             cwd=project_root,
         ),
-        agent_name="triage",
+        agent_name="backlog",
     )
     sdk_logger.log_start(
         model=model,
@@ -203,24 +242,31 @@ async def run_triage(
         cwd=str(project_root),
     )
 
-    structured: TriageResult | None = None
+    structured: BacklogItemResult | None = None
 
     try:
         async for message in query(prompt=prompt, options=options):
             sdk_logger.handle_message(message, echo_assistant_text=False)
-            if not structured:
-                structured = parse_structured_output(message, lambda data: TriageResult(
-                    labels=data.get("labels", []),
-                    priority=data.get("priority", "P3"),
-                    complexity=data.get("complexity", "M"),
-                    needs_clarification=data.get("needs_clarification", False),
-                    clarification_question=data.get("clarification_question"),
-                    ready_to_implement=data.get("ready_to_implement", False),
-                ))
+            if structured is None:
+                parsed = parse_structured_output(
+                    message,
+                    lambda data: BacklogItemResult(
+                        issue_number=issue_number,
+                        labels=cast(list[str], data.get("labels", [])),
+                        priority=cast(str, data.get("priority", "P3")),
+                        complexity=cast(str, data.get("complexity", "M")),
+                        needs_clarification=cast(bool, data.get("needs_clarification", False)),
+                        clarification_question=cast(str | None, data.get("clarification_question")),
+                        ready_to_implement=cast(bool, data.get("ready_to_implement", False)),
+                    ),
+                )
+                if parsed is not None:
+                    structured = parsed
+                    break
     finally:
         sdk_logger.log_completion()
 
     if structured is None:
-        raise RuntimeError("Triage agent did not return structured output")
+        raise RuntimeError("Backlog agent did not return structured output")
 
     return structured

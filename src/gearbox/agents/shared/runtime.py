@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from claude_agent_sdk import (
@@ -27,7 +27,7 @@ _HEARTBEAT_IDLE_THRESHOLD_SECONDS = 20.0
 
 
 def _timestamp() -> str:
-    return datetime.now(UTC).strftime("%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 def _print_line(text: str) -> None:
@@ -38,17 +38,18 @@ def _log(agent: str, stage: str, message: str) -> None:
     _print_line(f"[{_timestamp()}] [{agent}] [{stage}] {message}")
 
 
-def _format_usage(usage: dict[str, int] | None) -> str:
+def _format_usage(usage: Any) -> str:
     if not usage:
         return ""
 
     parts: list[str] = []
-    if usage.get("total_tokens") is not None:
-        parts.append(f"tokens={usage['total_tokens']}")
-    if usage.get("tool_uses") is not None:
-        parts.append(f"tool_uses={usage['tool_uses']}")
-    if usage.get("duration_ms") is not None:
-        parts.append(f"duration_ms={usage['duration_ms']}")
+    if isinstance(usage, dict):
+        if usage.get("total_tokens") is not None:
+            parts.append(f"tokens={usage['total_tokens']}")
+        if usage.get("tool_uses") is not None:
+            parts.append(f"tool_uses={usage['tool_uses']}")
+        if usage.get("duration_ms") is not None:
+            parts.append(f"duration_ms={usage['duration_ms']}")
     return ", ".join(parts)
 
 
@@ -56,6 +57,67 @@ def _format_mapping(data: dict[str, object] | None) -> str:
     if not data:
         return ""
     return ", ".join(f"{key}={value}" for key, value in data.items())
+
+
+def _truncate(text: str, limit: int = 160) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _format_tool_input(tool_name: str, tool_input: dict[str, Any] | None) -> str:
+    if not tool_input:
+        return ""
+
+    if tool_name == "Read":
+        path = tool_input.get("file_path") or tool_input.get("path")
+        offset = tool_input.get("offset")
+        limit = tool_input.get("limit")
+        details = []
+        if path:
+            details.append(f"path={path}")
+        if offset is not None:
+            details.append(f"offset={offset}")
+        if limit is not None:
+            details.append(f"limit={limit}")
+        return ", ".join(details)
+
+    if tool_name == "Glob":
+        pattern = tool_input.get("pattern")
+        path = tool_input.get("path")
+        details = []
+        if pattern:
+            details.append(f"pattern={pattern}")
+        if path:
+            details.append(f"path={path}")
+        return ", ".join(details)
+
+    if tool_name == "Grep":
+        pattern = tool_input.get("pattern")
+        path = tool_input.get("path")
+        details = []
+        if pattern:
+            details.append(f"pattern={_truncate(str(pattern), 120)}")
+        if path:
+            details.append(f"path={path}")
+        return ", ".join(details)
+
+    if tool_name == "Bash":
+        command = tool_input.get("command")
+        if command:
+            return f"command={_truncate(str(command), 140)}"
+        return ""
+
+    preferred_keys = ["file_path", "path", "pattern", "command", "query", "url"]
+    details = []
+    for key in preferred_keys:
+        value = tool_input.get(key)
+        if value:
+            details.append(f"{key}={_truncate(str(value), 120)}")
+    if details:
+        return ", ".join(details)
+
+    return _truncate(_format_mapping(tool_input), 160)
 
 
 def _safe_get(mapping: Any, *path: str) -> Any | None:
@@ -210,7 +272,15 @@ class SdkEventLogger:
                 return
             if self._current_block_type == "tool_use":
                 tool_name = _safe_get(event, "content_block", "name")
-                self._log("tool-use", f"tool={tool_name or 'unknown'}")
+                tool_input = _safe_get(event, "content_block", "input")
+                tool_details = _format_tool_input(
+                    str(tool_name or "unknown"),
+                    tool_input if isinstance(tool_input, dict) else None,
+                )
+                if tool_details:
+                    self._log("tool-use", f"tool={tool_name or 'unknown'}, {tool_details}")
+                else:
+                    self._log("tool-use", f"tool={tool_name or 'unknown'}")
                 return
             self._log("stream-content-start", f"block_type={self._current_block_type}")
             return

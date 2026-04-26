@@ -1,5 +1,6 @@
 """GitHub 操作模块 - 集中管理所有 gh/git 操作"""
 
+import json
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,54 @@ class CreatePrResult:
     success: bool
     pr_url: str | None = None
     error: str | None = None
+
+
+BACKLOG_LABEL_METADATA: dict[str, tuple[str, str]] = {
+    "P0": ("b60205", "生产环境故障、数据丢失风险"),
+    "P1": ("d93f0b", "核心功能受损、用户体验严重下降"),
+    "P2": ("fbca04", "一般功能问题、边界情况"),
+    "P3": ("0e8a16", "优化建议、便利性改进"),
+    "complexity:S": ("c2e0c6", "低复杂度，预计 1 小时内"),
+    "complexity:M": ("fef2c0", "中等复杂度，预计 1-3 天"),
+    "complexity:L": ("f9d0c4", "高复杂度，预计超过 3 天"),
+    "needs-clarification": ("d876e3", "需要补充信息或进一步澄清"),
+    "ready-to-implement": ("0e8a16", "需求清晰，可进入实现阶段"),
+}
+
+MANAGED_BACKLOG_LABELS = frozenset(BACKLOG_LABEL_METADATA)
+
+
+def _label_metadata(label: str) -> tuple[str, str]:
+    return BACKLOG_LABEL_METADATA.get(label, ("cfd3d7", "由 Gearbox 自动分类创建"))
+
+
+def create_repo_label(repo: str, label: str) -> PostReviewResult:
+    """创建仓库标签。"""
+    color, description = _label_metadata(label)
+    try:
+        subprocess.run(
+            [
+                "gh",
+                "label",
+                "create",
+                label,
+                "--repo",
+                repo,
+                "--color",
+                color,
+                "--description",
+                description,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return PostReviewResult(success=True)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.strip()
+        if "already exists" in stderr.lower():
+            return PostReviewResult(success=True)
+        return PostReviewResult(success=False, url=stderr)
 
 
 def post_review_comment(
@@ -95,6 +144,21 @@ def add_issue_labels(
     if not labels:
         return PostReviewResult(success=True)
 
+    # 验证标签是否存在
+    existing_labels = get_repo_labels(repo)
+    unknown_labels = [label for label in labels if label not in existing_labels]
+    if unknown_labels:
+        import sys
+
+        print(
+            f"⚠️ 警告: 以下标签在仓库中不存在，正在创建: {', '.join(unknown_labels)}",
+            file=sys.stderr,
+        )
+        for label in unknown_labels:
+            create_result = create_repo_label(repo, label)
+            if not create_result.success:
+                print(f"⚠️ 创建标签失败: {label}: {create_result.url}", file=sys.stderr)
+
     try:
         subprocess.run(
             [
@@ -114,6 +178,106 @@ def add_issue_labels(
         return PostReviewResult(success=True)
     except subprocess.CalledProcessError as e:
         return PostReviewResult(success=False, url=e.stderr.strip())
+
+
+def remove_issue_labels(
+    repo: str,
+    issue_number: int,
+    labels: list[str],
+) -> PostReviewResult:
+    """从 Issue 移除标签。"""
+    if not labels:
+        return PostReviewResult(success=True)
+
+    try:
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                "--repo",
+                repo,
+                str(issue_number),
+                "--remove-label",
+                ",".join(labels),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return PostReviewResult(success=True)
+    except subprocess.CalledProcessError as e:
+        return PostReviewResult(success=False, url=e.stderr.strip())
+
+
+def get_issue_labels(repo: str, issue_number: int) -> list[str]:
+    """获取 Issue 当前标签列表。"""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--json",
+                "labels",
+                "--jq",
+                "[.labels[].name]",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        labels = json.loads(result.stdout)
+        return [str(label) for label in labels]
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+
+
+def replace_managed_issue_labels(
+    repo: str,
+    issue_number: int,
+    labels: list[str],
+) -> PostReviewResult:
+    """幂等替换 Gearbox 管理标签，再添加新的分类标签。"""
+    current_labels = get_issue_labels(repo, issue_number)
+    next_labels = list(dict.fromkeys(labels))
+    managed_to_remove = [
+        label
+        for label in current_labels
+        if label in MANAGED_BACKLOG_LABELS and label not in next_labels
+    ]
+
+    remove_result = remove_issue_labels(repo, issue_number, managed_to_remove)
+    if not remove_result.success:
+        return remove_result
+
+    return add_issue_labels(repo, issue_number, next_labels)
+
+
+def get_repo_labels(repo: str) -> list[str]:
+    """
+    获取仓库现有的标签列表。
+
+    Args:
+        repo: 仓库标识
+
+    Returns:
+        标签名称列表
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "label", "list", "--repo", repo, "--json", "name"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        labels = json.loads(result.stdout)
+        return [label["name"] for label in labels]
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
 
 
 def prepare_branch(base_branch: str, temp_branch: str) -> None:
@@ -325,7 +489,7 @@ def build_issue_body(
     clarification_question: str | None,
     ready_to_implement: bool,
 ) -> str:
-    """构建 Triage 评论的 Markdown body。"""
+    """构建 Backlog 评论的 Markdown body。"""
     lines = [
         f"**优先级**: {priority}",
         f"**复杂度**: {complexity}",
