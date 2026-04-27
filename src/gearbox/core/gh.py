@@ -1,6 +1,7 @@
 """GitHub 操作模块 - 集中管理所有 gh/git 操作"""
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,15 @@ class CreatePrResult:
     error: str | None = None
 
 
+@dataclass
+class IssueSummary:
+    number: int
+    title: str
+    labels: list[str]
+    url: str
+    created_at: str
+
+
 BACKLOG_LABEL_METADATA: dict[str, tuple[str, str]] = {
     "P0": ("b60205", "生产环境故障、数据丢失风险"),
     "P1": ("d93f0b", "核心功能受损、用户体验严重下降"),
@@ -29,6 +39,8 @@ BACKLOG_LABEL_METADATA: dict[str, tuple[str, str]] = {
     "complexity:L": ("f9d0c4", "高复杂度，预计超过 3 天"),
     "needs-clarification": ("d876e3", "需要补充信息或进一步澄清"),
     "ready-to-implement": ("0e8a16", "需求清晰，可进入实现阶段"),
+    "in-progress": ("fbca04", "Gearbox 正在处理"),
+    "has-pr": ("0e8a16", "已有关联 PR"),
 }
 
 MANAGED_BACKLOG_LABELS = frozenset(BACKLOG_LABEL_METADATA)
@@ -85,6 +97,12 @@ def post_review_comment(
     Returns:
         PostReviewResult
     """
+    event_flag = {
+        "APPROVE": "--approve",
+        "COMMENT": "--comment",
+        "REQUEST_CHANGES": "--request-changes",
+    }.get(event, "--comment")
+
     try:
         subprocess.run(
             [
@@ -96,8 +114,7 @@ def post_review_comment(
                 str(pr_number),
                 "--body",
                 body,
-                "--event",
-                event,
+                event_flag,
             ],
             check=True,
             capture_output=True,
@@ -236,6 +253,75 @@ def get_issue_labels(repo: str, issue_number: int) -> list[str]:
         return []
 
 
+def list_open_issues(
+    repo: str, labels: list[str] | None = None, limit: int = 100
+) -> list[IssueSummary]:
+    """列出开放 Issue 摘要。"""
+    cmd = [
+        "gh",
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        "open",
+        "--limit",
+        str(limit),
+        "--json",
+        "number,title,labels,url,createdAt",
+    ]
+    for label in labels or []:
+        cmd.extend(["--label", label])
+
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        issues = json.loads(result.stdout)
+        return [
+            IssueSummary(
+                number=int(issue["number"]),
+                title=str(issue["title"]),
+                labels=[str(label["name"]) for label in issue.get("labels", [])],
+                url=str(issue.get("url", "")),
+                created_at=str(issue.get("createdAt", "")),
+            )
+            for issue in issues
+        ]
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError):
+        return []
+
+
+def get_issue_summary(repo: str, issue_number: int) -> IssueSummary | None:
+    """获取单个开放 Issue 摘要。"""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                repo,
+                "--json",
+                "number,title,labels,url,createdAt,state",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        issue = json.loads(result.stdout)
+        if issue.get("state") != "OPEN":
+            return None
+        return IssueSummary(
+            number=int(issue["number"]),
+            title=str(issue["title"]),
+            labels=[str(label["name"]) for label in issue.get("labels", [])],
+            url=str(issue.get("url", "")),
+            created_at=str(issue.get("createdAt", "")),
+        )
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
 def replace_managed_issue_labels(
     repo: str,
     issue_number: int,
@@ -314,6 +400,7 @@ def prepare_working_branch(base_branch: str) -> str:
 
 
 def finalize_and_push(
+    repo: str,
     temp_branch: str,
     final_branch: str,
     commit_message: str,
@@ -326,6 +413,8 @@ def finalize_and_push(
         True if successful, False otherwise
     """
     try:
+        configure_authenticated_origin(repo)
+
         # 重命名分支
         subprocess.run(["git", "branch", "-m", temp_branch, final_branch], check=True)
 
@@ -342,6 +431,7 @@ def finalize_and_push(
             capture_output=True,
         )
         if result.returncode == 1:  # 有变更
+            ensure_git_author()
             subprocess.run(["git", "commit", "-m", commit_message], check=True)
             subprocess.run(
                 ["git", "push", "-u", "origin", final_branch],
@@ -371,6 +461,8 @@ def finalize_and_create_pr(
         CreatePrResult
     """
     try:
+        configure_authenticated_origin(repo)
+
         # 重命名分支
         subprocess.run(["git", "branch", "-m", temp_branch, final_branch], check=True)
 
@@ -383,6 +475,7 @@ def finalize_and_create_pr(
             capture_output=True,
         )
         if result.returncode == 1:
+            ensure_git_author()
             subprocess.run(["git", "commit", "-m", commit_message], check=True)
             subprocess.run(
                 ["git", "push", "-u", "origin", final_branch],
@@ -400,7 +493,7 @@ def finalize_and_create_pr(
             base=base,
         )
     except subprocess.CalledProcessError as e:
-        return CreatePrResult(success=False, error=e.stderr.strip())
+        return CreatePrResult(success=False, error=_called_process_error_message(e))
 
 
 def create_pr(
@@ -439,7 +532,7 @@ def create_pr(
         )
         return CreatePrResult(success=True, pr_url=result.stdout.strip())
     except subprocess.CalledProcessError as e:
-        return CreatePrResult(success=False, error=e.stderr.strip())
+        return CreatePrResult(success=False, error=_called_process_error_message(e))
 
 
 def checkout_branch(branch_name: str) -> None:
@@ -450,6 +543,65 @@ def checkout_branch(branch_name: str) -> None:
 def delete_branch(branch_name: str) -> None:
     """删除本地分支。"""
     subprocess.run(["git", "branch", "-D", branch_name], check=False)
+
+
+def ensure_git_author() -> None:
+    """Ensure git commits have an identity in non-interactive CI runners."""
+    name = subprocess.run(
+        ["git", "config", "--get", "user.name"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    email = subprocess.run(
+        ["git", "config", "--get", "user.email"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    if not name:
+        actor = os.environ.get("GITHUB_ACTOR") or "github-actions"
+        subprocess.run(["git", "config", "user.name", actor], check=True)
+    if not email:
+        actor_id = os.environ.get("GITHUB_ACTOR_ID") or "41898282"
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "user.email",
+                f"{actor_id}+github-actions[bot]@users.noreply.github.com",
+            ],
+            check=True,
+        )
+
+
+def configure_authenticated_origin(repo: str) -> None:
+    """Prefer GH_TOKEN for git push so checkout credentials do not shadow PAT scopes."""
+    token = os.environ.get("GH_TOKEN")
+    if not token:
+        return
+
+    # actions/checkout injects an extraheader for github.token that overrides
+    # origin credentials. Remove it so PAT scopes on GH_TOKEN are honored.
+    subprocess.run(
+        ["git", "config", "--unset-all", "http.https://github.com/.extraheader"],
+        check=False,
+    )
+    subprocess.run(
+        [
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            f"https://x-access-token:{token}@github.com/{repo}.git",
+        ],
+        check=True,
+    )
+
+
+def _called_process_error_message(error: subprocess.CalledProcessError) -> str:
+    stderr = error.stderr.strip() if isinstance(error.stderr, str) else ""
+    stdout = error.stdout.strip() if isinstance(error.stdout, str) else ""
+    return stderr or stdout or str(error)
 
 
 def build_review_body(

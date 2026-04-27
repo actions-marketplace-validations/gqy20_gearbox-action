@@ -17,7 +17,7 @@ inputs:
   max_turns:
     description: 最大对话轮次
     required: false
-    default: '20'
+    default: '80'
   model:
     description: 使用的模型（可选）
     required: false
@@ -30,10 +30,22 @@ inputs:
     description: Anthropic API Key
     required: false
     default: ''
-  apply_side_effects:
-    description: 是否创建分支/PR（并行时建议关闭）
+  artifact_path:
+    description: '可选: 写出结构化结果 artifact'
+    required: false
+    default: ./implement-output/result.json
+  push_candidate_branch:
+    description: 是否推送候选实现分支
+    required: false
+    default: 'true'
+  create_pr:
+    description: 是否创建 PR（通常只由聚合阶段或单路实现开启）
     required: false
     default: 'false'
+  candidate_branch_suffix:
+    description: 候选分支后缀，用于并行实现隔离
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -52,7 +64,6 @@ runs:
     env:
       ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
       ANTHROPIC_BASE_URL_INPUT: ${{ inputs.anthropic_base_url }}
-      GH_TOKEN: ${{ github.token }}
     run: |
       set -e
 
@@ -64,23 +75,51 @@ runs:
       fi
       export PATH="$HOME/.local/bin:$PATH"
 
+      if { [ "${{ inputs.push_candidate_branch }}" = "true" ] || [ "${{ inputs.create_pr }}" = "true" ]; } && [ -z "${GH_TOKEN:-}" ]; then
+        echo "::error::GH_TOKEN is required when push_candidate_branch=true or create_pr=true. Pass secrets.GH_PAT so Gearbox can push branches or create PRs."
+        exit 1
+      fi
+
+      INPUT_ARTIFACT_PATH="${{ inputs.artifact_path }}"
+      ARTIFACT_PATH=""
+      if [ -n "$INPUT_ARTIFACT_PATH" ]; then
+        case "$INPUT_ARTIFACT_PATH" in
+          /*) ARTIFACT_PATH="$INPUT_ARTIFACT_PATH" ;;
+          *) ARTIFACT_PATH="${GITHUB_WORKSPACE}/${INPUT_ARTIFACT_PATH#./}" ;;
+        esac
+        mkdir -p "$(dirname "$ARTIFACT_PATH")"
+      fi
+
       CMD=(
-        uv run --directory "${GITHUB_ACTION_PATH}/../.." gearbox agent implement
+        uv run --project "${GITHUB_ACTION_PATH}/../.." --directory "$GITHUB_WORKSPACE" gearbox agent implement
         --repo "${{ inputs.repo }}"
         --issue "${{ inputs.issue_number }}"
         --base-branch "${{ inputs.base_branch }}"
         --max-turns "${{ inputs.max_turns }}"
-        --artifact-path ./implement-output/result.json
       )
+
+      if [ -n "$ARTIFACT_PATH" ]; then
+        CMD+=(--artifact-path "$ARTIFACT_PATH")
+      fi
 
       if [ -n "${{ inputs.model }}" ]; then
         CMD+=(--model "${{ inputs.model }}")
       fi
 
-      if [ "${{ inputs.apply_side_effects }}" = "true" ]; then
-        CMD+=(--apply-side-effects)
+      if [ "${{ inputs.push_candidate_branch }}" = "true" ]; then
+        CMD+=(--push-candidate-branch)
       else
-        CMD+=(--no-apply-side-effects)
+        CMD+=(--no-push-candidate-branch)
+      fi
+
+      if [ "${{ inputs.create_pr }}" = "true" ]; then
+        CMD+=(--create-pr)
+      else
+        CMD+=(--no-create-pr)
+      fi
+
+      if [ -n "${{ inputs.candidate_branch_suffix }}" ]; then
+        CMD+=(--candidate-branch-suffix "${{ inputs.candidate_branch_suffix }}")
       fi
 
       "${CMD[@]}"

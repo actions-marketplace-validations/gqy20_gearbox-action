@@ -34,6 +34,8 @@ jobs:
 - `audit`
 - `backlog`
 - `implement`
+- `cleanup`
+- `dispatch`
 - `review`
 - `publish`
 

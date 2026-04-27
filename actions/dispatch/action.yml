@@ -1,30 +1,35 @@
-name: Gearbox - Backlog
-description: AI 驱动的 Issue/backlog 批量分类、优先级判断和标签管理
+name: Gearbox - Dispatch
+description: 从 ready backlog 中选择 Issue，并按优先级触发实现 PR
 author: gqy20
 
 inputs:
   repo:
     description: 仓库标识 (owner/name)
     required: true
-  issues:
-    description: 逗号或空格分隔的 Issue 编号，数量决定单 issue 或 backlog 批量处理
-    required: true
+  issue_number:
+    description: 指定 Issue 编号（可选）
+    required: false
+    default: ''
+  max_items:
+    description: 最多处理多少个 Issue
+    required: false
+    default: '1'
+  base_branch:
+    description: PR 目标分支
+    required: false
+    default: main
+  dry_run:
+    description: 是否只输出计划，不创建分支和 PR
+    required: false
+    default: 'true'
   max_turns:
     description: 最大对话轮次
     required: false
-    default: '5'
+    default: '80'
   model:
     description: 使用的模型（可选）
     required: false
     default: ''
-  artifact_path:
-    description: '可选: 写出结构化结果 artifact'
-    required: false
-    default: ''
-  apply_side_effects:
-    description: 是否应用 GitHub 标签/评论副作用（并行时建议关闭）
-    required: false
-    default: 'false'
   anthropic_base_url:
     description: Anthropic 兼容接口 Base URL（可选）
     required: false
@@ -45,13 +50,12 @@ runs:
   - name: Setup Gearbox runtime
     uses: ./actions/_runtime
 
-  - name: Run Backlog Agent
+  - name: Run Dispatch
     id: run
     shell: bash
     env:
       ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
       ANTHROPIC_BASE_URL_INPUT: ${{ inputs.anthropic_base_url }}
-      GH_TOKEN: ${{ github.token }}
     run: |
       set -e
 
@@ -63,35 +67,33 @@ runs:
       fi
       export PATH="$HOME/.local/bin:$PATH"
 
-      INPUT_ARTIFACT_PATH="${{ inputs.artifact_path }}"
-      ARTIFACT_PATH=""
-      if [ -n "$INPUT_ARTIFACT_PATH" ]; then
-        case "$INPUT_ARTIFACT_PATH" in
-          /*) ARTIFACT_PATH="$INPUT_ARTIFACT_PATH" ;;
-          *) ARTIFACT_PATH="${GITHUB_WORKSPACE}/${INPUT_ARTIFACT_PATH#./}" ;;
-        esac
-        mkdir -p "$(dirname "$ARTIFACT_PATH")"
+      if [ "${{ inputs.dry_run }}" != "true" ] && [ -z "${GH_TOKEN:-}" ]; then
+        echo "::error::GH_TOKEN is required when dispatch dry_run=false. Pass secrets.GH_PAT so Gearbox can push branches and create PRs."
+        exit 1
       fi
 
       CMD=(
-        uv run --directory "${GITHUB_ACTION_PATH}/../.." gearbox agent backlog
+        uv run --directory "${GITHUB_ACTION_PATH}/../.." gearbox dispatch run
         --repo "${{ inputs.repo }}"
-        --issues "${{ inputs.issues }}"
+        --max-items "${{ inputs.max_items }}"
+        --base-branch "${{ inputs.base_branch }}"
         --max-turns "${{ inputs.max_turns }}"
       )
+
+      if [ -n "${{ inputs.issue_number }}" ]; then
+        CMD+=(--issue "${{ inputs.issue_number }}")
+      fi
 
       if [ -n "${{ inputs.model }}" ]; then
         CMD+=(--model "${{ inputs.model }}")
       fi
-      if [ -n "$ARTIFACT_PATH" ]; then
-        CMD+=(--artifact-path "$ARTIFACT_PATH")
-      fi
-      if [ "${{ inputs.apply_side_effects }}" = "true" ]; then
-        CMD+=(--apply-side-effects)
+
+      if [ "${{ inputs.dry_run }}" = "true" ]; then
+        CMD+=(--dry-run)
       else
-        CMD+=(--no-apply-side-effects)
+        CMD+=(--no-dry-run)
       fi
 
       "${CMD[@]}"
 
-      echo "status=success" >> $GITHUB_OUTPUT
+      echo "status=success" >> "$GITHUB_OUTPUT"
