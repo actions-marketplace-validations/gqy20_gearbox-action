@@ -19,12 +19,22 @@ EVALUATOR_SCHEMA: dict[str, Any] = {
         },
         "scores": {
             "type": "object",
-            "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
-            "description": "每个结果的评分 0-1",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "score": {"type": "number", "minimum": 0, "maximum": 1},
+                    "justification": {
+                        "type": "string",
+                        "description": "该分数的具体依据或证据",
+                    },
+                },
+                "required": ["score", "justification"],
+            },
+            "description": "每个结果的评分 (0-1) 及评分依据",
         },
         "reasoning": {
             "type": "string",
-            "description": "详细推理过程",
+            "description": "详细推理过程，不少于 100 字，必须包含：为什么 winner 比其他好？其他结果被拒绝的具体原因？",
         },
         "consensus": {
             "type": "array",
@@ -41,7 +51,7 @@ class EvaluationResult:
     """评估结果"""
 
     winner: int  # 最佳结果索引
-    scores: dict[int, float]  # 每个结果的评分
+    scores: dict[int, dict[str, Any]]  # 每个结果的评分及依据 {"score": 0.8, "justification": "..."}
     reasoning: str  # 推理过程
     consensus: list[str] = field(default_factory=list)  # 共识项
 
@@ -69,8 +79,8 @@ SYSTEM_PROMPT = """你是结果评估专家。请评估多个候选结果，选�
 请直接返回符合 JSON Schema 的结构化结果，不要输出 Markdown 代码块。
 
 - winner: 最佳结果的索引 (0-9)
-- scores: 每个结果的评分 (0-1)
-- reasoning: 详细解释，不少于 100 字
+- scores: 每个结果的评分 (0-1) 及评分依据 justification（必须说明具体证据）
+- reasoning: 详细解释，不少于 100 字。必须包含：为什么 winner 比其他的好？其他结果被拒绝的具体原因是什么？共识项有哪些？
 - consensus: 多个结果一致认为重要的项列表（可选）"""
 
 
@@ -185,7 +195,13 @@ async def run_evaluator(
                     message,
                     lambda data: EvaluationResult(
                         winner=int(data.get("winner", 0)),
-                        scores={int(k): float(v) for k, v in data.get("scores", {}).items()},
+                        scores={
+                            int(k): {
+                                "score": float(v.get("score", 0)),
+                                "justification": v.get("justification", ""),
+                            }
+                            for k, v in data.get("scores", {}).items()
+                        },
                         reasoning=data.get("reasoning", ""),
                         consensus=data.get("consensus", []),
                     ),

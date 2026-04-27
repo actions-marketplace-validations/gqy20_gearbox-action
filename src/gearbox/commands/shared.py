@@ -36,7 +36,11 @@ def _apply_backlog_item(repo: str, result: object) -> None:
 
 
 def _apply_backlog_item_with_comments(repo: str, result: object, *, comment_mode: str) -> None:
-    """Apply backlog labels and optionally publish classification comments."""
+    """Apply backlog labels and optionally publish classification comments.
+
+    comment_mode:
+      - auto:   更新标签 + 发布 ready-to-implement 评论
+      - never:  仅更新标签，不发布任何评论（适用于 schedule 静默运行）"""
     issue_number = getattr(result, "issue_number", None)
     if issue_number is None:
         raise click.ClickException("backlog item missing issue_number")
@@ -50,13 +54,7 @@ def _apply_backlog_item_with_comments(repo: str, result: object, *, comment_mode
     if comment_mode == "never":
         return
 
-    needs_clarification = bool(getattr(result, "needs_clarification", False))
-    clarification_question = getattr(result, "clarification_question", None)
     ready_to_implement = bool(getattr(result, "ready_to_implement", False))
-    if needs_clarification and clarification_question:
-        comment_result = post_issue_comment(repo, issue_number, f"👋 {clarification_question}")
-        if not comment_result.success:
-            click.echo(f"⚠️ 发布评论失败: {comment_result.url}", err=True)
     if ready_to_implement:
         comment_result = post_issue_comment(
             repo, issue_number, "✅ 此 Issue 分类完成，标记为 ready-to-implement"

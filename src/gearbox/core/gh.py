@@ -253,6 +253,51 @@ def get_issue_labels(repo: str, issue_number: int) -> list[str]:
         return []
 
 
+@dataclass
+class LabelEvent:
+    label: str
+    event: str  # "labeled" or "unlabeled"
+    created_at: str
+
+
+def get_issue_label_events(
+    repo: str,
+    issue_number: int,
+    labels: set[str],
+    since_days: int = 2,
+) -> list[LabelEvent]:
+    """获取指定标签在近 N 天内的变更事件（labeled/unlabeled）。"""
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/{issue_number}/timeline",
+                "--jq",
+                '.[] | select(.event == "labeled" or .event == "unlabeled") | {event: .event, label: .label.name, created_at: .created_at}',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        events: list[LabelEvent] = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj["label"] in labels:
+                events.append(
+                    LabelEvent(
+                        label=obj["label"],
+                        event=obj["event"],
+                        created_at=obj["created_at"],
+                    )
+                )
+        return events
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+
+
 def list_open_issues(
     repo: str, labels: list[str] | None = None, limit: int = 100
 ) -> list[IssueSummary]:
@@ -635,25 +680,6 @@ def build_review_body(
     return "\n\n".join(lines)
 
 
-def build_issue_body(
-    priority: str,
-    complexity: str,
-    clarification_question: str | None,
-    ready_to_implement: bool,
-) -> str:
-    """构建 Backlog 评论的 Markdown body。"""
-    lines = [
-        f"**优先级**: {priority}",
-        f"**复杂度**: {complexity}",
-        f"**可实现**: {'✅' if ready_to_implement else '❌'}",
-    ]
-
-    if clarification_question:
-        lines.append(f"\n**需要澄清**: {clarification_question}")
-
-    return "\n\n".join(lines)
-
-
 def write_outputs(
     outputs: dict[str, str],
     path: str = "/tmp/github_output",
@@ -665,6 +691,7 @@ def write_outputs(
 
 
 VALID_ISSUE_LABELS = {
+    # GitHub defaults
     "bug",
     "documentation",
     "duplicate",
@@ -674,6 +701,29 @@ VALID_ISSUE_LABELS = {
     "invalid",
     "question",
     "wontfix",
+    # Priority
+    "P0",
+    "P1",
+    "P2",
+    "P3",
+    "P4",
+    # Complexity
+    "complexity:S",
+    "complexity:M",
+    "complexity:L",
+    # Status
+    "ready-to-implement",
+    "in-progress",
+    "needs-clarification",
+    "has-pr",
+    # Categories
+    "security",
+    "ci",
+    # Audit priority
+    "critical",
+    "high",
+    "medium",
+    "low",
 }
 
 

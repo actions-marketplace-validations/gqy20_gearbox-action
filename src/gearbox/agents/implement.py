@@ -34,6 +34,14 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "type": "boolean",
             "description": "是否已提交并准备好等待 review",
         },
+        "failure_reason": {
+            "type": ["string", "null"],
+            "description": "无法完成时的原因说明（阻塞点、分析失败等）",
+        },
+        "blocked_reason": {
+            "type": ["string", "null"],
+            "description": "如果实现被阻塞，填写具体原因",
+        },
     },
     "required": ["branch_name", "summary", "files_changed", "ready_for_review"],
 }
@@ -52,6 +60,8 @@ class ImplementResult:
     files_changed: list[str]
     pr_url: str | None
     ready_for_review: bool
+    failure_reason: str | None = None
+    blocked_reason: str | None = None
 
 
 def write_implement_result(result: ImplementResult, output_path: Path) -> None:
@@ -72,6 +82,8 @@ def load_implement_result(path: Path) -> ImplementResult:
         files_changed=cast(list[str], data.get("files_changed", [])),
         pr_url=cast(str | None, data.get("pr_url")),
         ready_for_review=cast(bool, data.get("ready_for_review", False)),
+        failure_reason=cast(str | None, data.get("failure_reason")),
+        blocked_reason=cast(str | None, data.get("blocked_reason")),
     )
 
 
@@ -112,19 +124,27 @@ def _gh_pr_view(repo: str, pr_number: int) -> Any:
 
 SYSTEM_PROMPT = """你是代码实现专家。请根据 Issue 描述实现代码变更。
 
-## 工作流程
+## 工作流程（必须遵循 TDD）
 
 1. 阅读 Issue 了解需求
 2. 分析代码库结构，找到相关文件
-3. 实现代码变更
-4. 运行必要的测试和 lint
-5. 返回结构化实现结果
+3. **先写测试**：为要实现的功能写一个会失败的测试，运行它确认失败
+4. **实现功能**：编写代码让测试通过
+5. **运行完整检查**：`uv run pytest` 和 `uv run ruff check src`
+6. 返回结构化实现结果
+
+## 强制约束
+
+- `ready_for_review=true` 的前提是：测试必须全部通过，lint 必须干净
+- 如果测试无法编写（例如被测代码是纯脚本），跳过此步骤但需在 summary 中说明原因
+- **不要**先实现后补测试——顺序必须是：测试（失败）→ 实现（通过）→ 检查
+- **失败循环约束**：同一测试连续失败超过 3 次，必须停下来分析原因，将 `blocked_reason` 填入返回结果，**不要**继续盲目重试
+- **无法完成**：如果遇到无法解决的阻塞（需求不清、依赖缺失、技术不可行），设置 `ready_for_review=false` 并在 `failure_reason` 中说明原因，**不要**假装完成了
 
 ## 安全约束
 
 - 只修改当前工作区文件，**不要**执行 `git commit`、`git push`、`gh pr create`
 - 外层 Gearbox 编排器会负责创建分支、提交、推送和 PR
-- 提交/PR 之前必须运行测试和 lint
 - branch_name 只需要给出建议分支名，必须使用 `feat/issue-{number}` 或
   `gearbox/implement-{number}` 前缀
 
@@ -138,7 +158,8 @@ pr_url 请返回 null，外层编排器创建 PR 后会回填。
 
 - branch_name 必须以 feat/ 或 gearbox/ 开头
 - files_changed 列出所有修改文件
-- ready_for_review=true 表示工作区修改完成并已通过检查"""
+- ready_for_review=true 表示工作区修改完成并已通过检查
+- 如果无法完成，failure_reason 或 blocked_reason 必须有值"""
 
 
 async def run_implement(
@@ -219,6 +240,8 @@ async def run_implement(
                         files_changed=data.get("files_changed", []),
                         pr_url=data.get("pr_url"),
                         ready_for_review=data.get("ready_for_review", False),
+                        failure_reason=data.get("failure_reason"),
+                        blocked_reason=data.get("blocked_reason"),
                     ),
                 )
                 if parsed is not None:

@@ -45,6 +45,10 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             },
             "description": "具体审查意见列表",
         },
+        "failure_reason": {
+            "type": ["string", "null"],
+            "description": "无法完成审查时的原因说明",
+        },
     },
     "required": ["verdict", "score", "summary", "comments"],
 }
@@ -72,6 +76,7 @@ class ReviewResult:
     score: int
     summary: str
     comments: list[ReviewComment]
+    failure_reason: str | None = None
 
 
 def _coerce_optional_line(value: object) -> int | None:
@@ -105,6 +110,7 @@ def load_review_result(path: Path) -> ReviewResult:
             )
             for comment in cast(list[dict[str, object]], data.get("comments", []))
         ],
+        failure_reason=cast(str | None, data.get("failure_reason")),
     )
 
 
@@ -144,7 +150,7 @@ SYSTEM_PROMPT = """你是资深 Code Review 专家。请对 PR 进行全面审�
 1. **逻辑正确性** — 是否有 bug、边界情况未处理
 2. **安全漏洞** — SQL注入、XSS、敏感信息泄露等
 3. **性能问题** — N+1查询、不必要的重复计算等
-4. **测试覆盖** — 核心逻辑是否有对应测试
+4. **测试覆盖**（强制）— 核心逻辑缺少测试必须在 comments 中指出，标记为 `warning` 级别
 5. **代码规范** — 命名、注释、重复代码等
 
 ## 审查意见级别
@@ -167,7 +173,8 @@ SYSTEM_PROMPT = """你是资深 Code Review 专家。请对 PR 进行全面审�
 
 - blocker 意见必须修复才能 LGTM
 - comments 最少 1 条，最多 20 条
-- 优先关注安全和逻辑问题"""
+- 优先关注安全和逻辑问题
+- 如果无法完成审查，在 `failure_reason` 中说明原因"""
 
 
 async def run_review(
@@ -176,6 +183,7 @@ async def run_review(
     *,
     model: str = "claude-sonnet-4-6",
     max_turns: int = 10,
+    previous_review_summary: str | None = None,
 ) -> ReviewResult:
     """
     执行 PR Code Review。
@@ -185,6 +193,7 @@ async def run_review(
         pr_number: PR 编号
         model: 使用的模型
         max_turns: 最大对话轮次
+        previous_review_summary: 上一次审查的摘要，用于增量审查（可选）
 
     Returns:
         ReviewResult 结构
@@ -200,14 +209,20 @@ async def run_review(
     pr_info = _gh_pr_view(repo, pr_number)
     diff_text = _gh_pr_diff(repo, pr_number)
 
+    prev_summary_block = (
+        f"**上次审查摘要**（请重点关注新增变化）:\n{previous_review_summary}\n\n"
+        if previous_review_summary
+        else ""
+    )
+
     prompt = f"""## PR 信息
 
 **仓库**: {repo}
 **编号**: #{pr_number}
 **标题**: {pr_info["title"]}
-**分支**: {pr_info["headRefName"]} → {pr_info["baseRefName"]}
+**分支**: {pr_info["headRefName"]} -> {pr_info["baseRefName"]}
 
-**Diff**:
+{prev_summary_block}**Diff**:
 
 {diff_text[:8000]}
 
@@ -253,6 +268,7 @@ async def run_review(
                             )
                             for comment in cast(list[dict[str, object]], data.get("comments", []))
                         ],
+                        failure_reason=cast(str | None, data.get("failure_reason")),
                     ),
                 )
                 if parsed is not None:

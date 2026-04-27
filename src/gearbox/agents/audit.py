@@ -2,7 +2,6 @@
 
 import json
 import shutil
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -10,6 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import click
+
+from gearbox.agents.shared import clone_repository
+from gearbox.core.gh import IssueSummary
 
 # =============================================================================
 # Schema 定义
@@ -45,6 +47,10 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             },
             "description": "改进建议列表",
         },
+        "failure_reason": {
+            "type": ["string", "null"],
+            "description": "无法完成审计时的原因说明",
+        },
     },
     "required": ["repo", "profile", "comparison_markdown", "issues"],
 }
@@ -76,6 +82,7 @@ class AuditResult:
     benchmarks: list[str] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
     cost: float | None = None
+    failure_reason: str | None = None
 
 
 def _write_audit_outputs(result: AuditResult, output_dir: Path) -> None:
@@ -88,6 +95,7 @@ def _write_audit_outputs(result: AuditResult, output_dir: Path) -> None:
         "benchmarks": result.benchmarks,
         "issues": [
             {
+                "repo": result.repo,
                 "title": issue.title,
                 "body": issue.body,
                 "labels": issue.labels,
@@ -138,30 +146,6 @@ def _cache_benchmarks(repo: str, benchmarks: list[str]) -> None:
     )
 
 
-def _clone_repository(repo: str) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
-    """将目标仓库克隆到临时目录，供扫描和 Agent 分析统一使用。"""
-    temp_dir = tempfile.TemporaryDirectory(prefix="gearbox-audit-")
-    clone_root = Path(temp_dir.name) / "repo"
-
-    if Path(repo).exists():
-        source = str(Path(repo).resolve())
-        cmd = ["git", "clone", "--depth", "1", source, str(clone_root)]
-    else:
-        cmd = ["gh", "repo", "clone", repo, str(clone_root), "--", "--depth", "1"]
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        temp_dir.cleanup()
-        stderr = result.stderr.strip() or result.stdout.strip() or "unknown clone error"
-        raise RuntimeError(f"clone failed for {repo}: {stderr}")
-
-    return clone_root, temp_dir
-
-
 def load_audit_result(output_dir: Path) -> AuditResult:
     """从 audit 产物目录恢复 AuditResult。"""
     issues_path = output_dir / "issues.json"
@@ -206,7 +190,7 @@ SYSTEM_PROMPT = """你是 Gearbox，一个专业的代码库审计专家。
 1. **已预扫描**: 如果提供了扫描结果摘要，说明仓库已经过静态分析工具扫描
 2. 用 `gh repo view` 查看远程仓库信息（仅远程仓库需要）
 3. 用 `gh search repos` 发现对标项目（如果未提供 benchmarks）
-4. 用 ctx7 查询相关库的官方文档（`npx ctx7 docs <library-id> <query>`）
+4. **必须**使用 ctx7 查询相关技术栈的官方文档（`npx ctx7 docs <library-id> <query>`），确保建议基于最新实践
 5. 自主分析并生成结构化报告
 
 ## 重要: 避免重复搜索
@@ -234,7 +218,17 @@ SYSTEM_PROMPT = """你是 Gearbox，一个专业的代码库审计专家。
 - 精选最重要的改进项
 - 不要尝试创建 GitHub Issue
 - `comparison_markdown` 必须是完整 Markdown
-- `issues` 里的每条记录都要可直接写入 `issues.json`"""
+- `issues` 里的每条记录都要可直接写入 `issues.json`
+- 如果无法完成审计，在 `failure_reason` 中说明原因
+
+## 已有 Issue 指引
+
+仓库中已存在以下 open Issues（下方提供）。**对于这些已有 Issue，你的职责是：**
+- **不要深入分析**其根本原因或解决方案（已有 owner 处理）
+- **只需标注它们存在**，在对比分析中提及差距已记录
+- **聚焦发现全新问题**：寻找扫描结果中暗示但未被这些已有 Issue 覆盖的盲区
+
+换句话说：你应该发现"还有什么东西没被人注意到"，而不是重复已有的发现。"""
 
 
 async def run_audit(
@@ -288,7 +282,7 @@ async def run_audit(
 
     try:
         click.echo(f"📥 克隆目标仓库: {repo}")
-        clone_root, clone_dir = _clone_repository(repo)
+        clone_root, clone_dir = clone_repository(repo)
         click.echo(f"✅ 仓库已克隆到: {clone_root}")
 
         if enable_prescan:
@@ -326,12 +320,29 @@ async def run_audit(
             if benchmarks:
                 click.echo(f"📦 使用缓存的对标仓库: {len(benchmarks)} 个")
 
+        existing_issues: list[IssueSummary] = []
+        existing_issues_str = ""
+        # 仅远程仓库需要拉取已有 Issues，本地路径不具备 GitHub 上下文
+        if "/" in repo:
+            from gearbox.agents.shared.prompt_helpers import format_issues_summary
+            from gearbox.core.gh import list_open_issues
+
+            existing_issues = list_open_issues(repo, limit=200)
+            if existing_issues:
+                click.echo(f"📋 已有 open Issues: {len(existing_issues)} 个")
+                existing_issues_str = format_issues_summary(
+                    existing_issues, header="仓库已有 Open Issues"
+                )
+
+        prompt_parts = []
         if scan_summary and enable_prescan:
+            prompt_parts.append(f"```json\n{scan_summary}\n```")
+        prompt_parts.append(existing_issues_str)
+
+        if prompt_parts:
             resolved_prompt = f"""{resolved_prompt}
 
-```json
-{scan_summary}
-```"""
+{"".join(prompt_parts)}"""
 
         options, sdk_logger = prepare_agent_options(
             ClaudeAgentOptions(
@@ -396,6 +407,7 @@ async def run_audit(
                                 )
                                 for item in data.get("issues", [])
                             ],
+                            failure_reason=data.get("failure_reason"),
                         ),
                     )
                     if parsed is not None:

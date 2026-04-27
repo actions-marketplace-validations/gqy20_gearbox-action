@@ -30,17 +30,13 @@ OUTPUT_SCHEMA: dict[str, Any] = {
             "enum": ["S", "M", "L"],
             "description": "实现复杂度：S=<1h，M=1-3天，L=>3天",
         },
-        "needs_clarification": {
-            "type": "boolean",
-            "description": "是否需要追问澄清",
-        },
-        "clarification_question": {
-            "type": ["string", "null"],
-            "description": "如果需要澄清，填入追问内容",
-        },
         "ready_to_implement": {
             "type": "boolean",
             "description": "是否清晰可实现，可以开始编码",
+        },
+        "failure_reason": {
+            "type": ["string", "null"],
+            "description": "无法完成分类时的原因说明",
         },
     },
     "required": ["labels", "priority", "ready_to_implement"],
@@ -58,10 +54,9 @@ class BacklogItemResult:
     labels: list[str]
     priority: str  # P0/P1/P2/P3
     complexity: str  # S/M/L
-    needs_clarification: bool
-    clarification_question: str | None
     ready_to_implement: bool
     issue_number: int | None = None
+    failure_reason: str | None = None
 
 
 @dataclass
@@ -72,8 +67,35 @@ class BacklogResult:
 
 
 def parse_issue_numbers(value: str) -> list[int]:
-    """Parse comma/space separated issue numbers."""
-    numbers = [int(part) for part in re.split(r"[\s,]+", value.strip()) if part]
+    """Parse comma/space separated issue numbers, supporting ``#`` prefix.
+
+    Accepts inputs like ``#12``, ``#12, #13``, ``12 #13,14``.
+    Returns an empty list for blank input.
+    Raises :class:`ValueError` with a helpful message when a token
+    cannot be parsed as an integer.
+    """
+    if not value.strip():
+        return []
+
+    raw_tokens = re.split(r"[\s,]+", value.strip())
+    numbers: list[int] = []
+    bad_tokens: list[str] = []
+
+    for token in raw_tokens:
+        if not token:
+            continue
+        stripped = token.lstrip("#")
+        try:
+            numbers.append(int(stripped))
+        except ValueError:
+            bad_tokens.append(token)
+
+    if bad_tokens:
+        raise ValueError(
+            f"无法解析 issue 编号: {', '.join(repr(t) for t in bad_tokens)}。"
+            f"请使用数字或 #数字 格式，例如 '12, 13' 或 '#12 #13'"
+        )
+
     return list(dict.fromkeys(numbers))
 
 
@@ -85,8 +107,6 @@ def github_labels_for_backlog_item(result: BacklogItemResult) -> list[str]:
         f"complexity:{result.complexity}",
     ]
 
-    if result.needs_clarification:
-        labels.append("needs-clarification")
     if result.ready_to_implement:
         labels.append("ready-to-implement")
 
@@ -112,9 +132,8 @@ def load_backlog_result(path: Path) -> BacklogResult:
                 labels=cast(list[str], item.get("labels", [])),
                 priority=cast(str, item.get("priority", "P3")),
                 complexity=cast(str, item.get("complexity", "M")),
-                needs_clarification=cast(bool, item.get("needs_clarification", False)),
-                clarification_question=cast(str | None, item.get("clarification_question")),
                 ready_to_implement=cast(bool, item.get("ready_to_implement", False)),
+                failure_reason=cast(str | None, item.get("failure_reason")),
             )
             for item in cast(list[dict[str, object]], raw_items)
         ]
@@ -167,7 +186,12 @@ SYSTEM_PROMPT = """你是 Issue 分类专家。请分析 GitHub Issue 并提供�
    - M: 1-3天
    - L: 超过3天
 
-4. **是否需要澄清**: 如果 Issue 缺少复现步骤、期望行为、上下文等信息，应标记需要澄清
+## 源码分析
+
+在分类前，你应当使用 Read/Bash 工具了解相关代码上下文，结合源码判断：
+- 问题的本质（是否真的影响核心功能）
+- 修复所需改动的大小（影响几个文件、是否需要改公共接口）
+- 依赖和测试覆盖情况（是否容易引入回归）
 
 ## 输出格式
 
@@ -177,8 +201,8 @@ SYSTEM_PROMPT = """你是 Issue 分类专家。请分析 GitHub Issue 并提供�
 - labels 至少一个标签
 - priority 只可是 P0/P1/P2/P3
 - complexity 只可是 S/M/L
-- needs_clarification=true 时 clarification_question 必填
-- ready_to_implement=true 表示可进入实现阶段"""
+- ready_to_implement=true 表示可进入实现阶段
+- 如果无法完成分类，在 failure_reason 中说明原因"""
 
 
 async def run_backlog_item(
@@ -186,7 +210,7 @@ async def run_backlog_item(
     issue_number: int,
     *,
     model: str = "claude-sonnet-4-6",
-    max_turns: int = 5,
+    max_turns: int = 15,
 ) -> BacklogItemResult:
     """
     执行 Issue 分类。
@@ -200,17 +224,21 @@ async def run_backlog_item(
     Returns:
         BacklogItemResult 结构
     """
-    from pathlib import Path
+    import tempfile
 
     from claude_agent_sdk import ClaudeAgentOptions, query
 
+    from gearbox.agents.shared import clone_repository
+    from gearbox.agents.shared.prompt_helpers import format_issues_summary
     from gearbox.agents.shared.runtime import prepare_agent_options
     from gearbox.agents.shared.structured import json_schema_output, parse_structured_output
+    from gearbox.core.gh import list_open_issues
 
-    project_root = Path(__file__).resolve().parents[3]
     issue = _gh_issue_view(repo, issue_number)
+    all_issues = list_open_issues(repo, limit=50)
+    issues_summary = format_issues_summary(all_issues, current_issue_number=issue_number)
 
-    prompt = f"""## Issue 信息
+    prompt = f"""## 当前 Issue 信息
 
 **仓库**: {repo}
 **编号**: #{issue_number}
@@ -221,8 +249,22 @@ async def run_backlog_item(
 
 **现有标签**: {", ".join(issue["labels"]) if issue["labels"] else "(无)"}
 
+## {issues_summary}
+
 ---
 {SYSTEM_PROMPT}"""
+
+    clone_root: Path | None = None
+    clone_dir: tempfile.TemporaryDirectory[str] | None = None
+
+    # 仅远程仓库（owner/repo 格式）需要克隆，本地路径不具备 GitHub API 上下文
+    if "/" in repo:
+        try:
+            clone_root, clone_dir = clone_repository(repo)
+        except Exception:
+            pass  # 克隆失败时 cwd 未定义，由 Agent 自行处理
+
+    cwd = clone_root if clone_root else Path.cwd()
 
     options, sdk_logger = prepare_agent_options(
         ClaudeAgentOptions(
@@ -231,7 +273,7 @@ async def run_backlog_item(
             output_format=json_schema_output(OUTPUT_SCHEMA),
             allowed_tools=["Read", "Bash"],
             skills="all",
-            cwd=project_root,
+            cwd=cwd,
         ),
         agent_name="backlog",
     )
@@ -239,7 +281,7 @@ async def run_backlog_item(
         model=model,
         max_turns=max_turns,
         base_url=options.env.get("ANTHROPIC_BASE_URL"),
-        cwd=str(project_root),
+        cwd=str(cwd),
     )
 
     structured: BacklogItemResult | None = None
@@ -255,9 +297,8 @@ async def run_backlog_item(
                         labels=cast(list[str], data.get("labels", [])),
                         priority=cast(str, data.get("priority", "P3")),
                         complexity=cast(str, data.get("complexity", "M")),
-                        needs_clarification=cast(bool, data.get("needs_clarification", False)),
-                        clarification_question=cast(str | None, data.get("clarification_question")),
                         ready_to_implement=cast(bool, data.get("ready_to_implement", False)),
+                        failure_reason=cast(str | None, data.get("failure_reason")),
                     ),
                 )
                 if parsed is not None:
@@ -265,6 +306,8 @@ async def run_backlog_item(
                     break
     finally:
         sdk_logger.log_completion()
+        if clone_dir is not None:
+            clone_dir.cleanup()
 
     if structured is None:
         raise RuntimeError("Backlog agent did not return structured output")
